@@ -79,6 +79,7 @@ Astraeus splits one task into **exactly two file-disjoint subtasks** (no shared 
 5. Report: clean `main`, both contributions landed, tests green.
 
 ## Build sequence — do not skip ahead
+- **Step 0 (spike, throwaway):** one deep agent, shell/filesystem backend scoped to a temp dir, prompt "create hello.txt". Confirm the file lands in that dir and nowhere else. Delete it. Do not start Step 1 until this passes.
 - **Step 1:** orchestrator + **one** Astra → commit on `featW1` → `merge_gate` → merge. Get green. Commit. **Report and stop.**
 - **Step 2:** add a second Astra + `featW2`. Both land. Commit. Report and stop.
 - **Step 3:** plant a deliberately failing test → confirm the reject/retry path fires. Commit.
