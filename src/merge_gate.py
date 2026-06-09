@@ -8,7 +8,7 @@ merge conflict) it leaves origin's main untouched and hands the log back.
 All docker/git ops are list-form via dcmd() and check their exit codes.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from src.docker_backend import IMAGE, ORIGIN_VOLUME, dcmd
 
@@ -19,6 +19,7 @@ GATE_CONTAINER = "astraeus_gate"
 class MergeResult:
     ok: bool
     log: str = ""
+    conflicts: list = field(default_factory=list)  # files in conflict (git diff --diff-filter=U)
 
 
 def _combined(p):
@@ -50,9 +51,13 @@ def merge_gate(branch, origin_volume=ORIGIN_VOLUME, image=IMAGE):
         merge = dcmd(["exec", "-w", "/workspace", GATE_CONTAINER,
                       "git", "merge", "--no-ff", branch, "-m", f"merge {branch}"], check=False)
         if merge.returncode != 0:
-            # e.g. a real conflict — abort cleanly so origin stays consistent.
+            # A real conflict: record the unmerged files, then abort cleanly so
+            # origin's main stays untouched.
+            u = dcmd(["exec", "-w", "/workspace", GATE_CONTAINER,
+                      "git", "diff", "--name-only", "--diff-filter=U"], check=False)
+            conflicts = [f for f in u.stdout.split() if f]
             dcmd(["exec", "-w", "/workspace", GATE_CONTAINER, "git", "merge", "--abort"], check=False)
-            return MergeResult(ok=False, log=_combined(merge))
+            return MergeResult(ok=False, log=_combined(merge), conflicts=conflicts)
         push = dcmd(["exec", "-w", "/workspace", GATE_CONTAINER, "git", "push", "origin", "main"], check=False)
         if push.returncode != 0:
             return MergeResult(ok=False, log=_combined(push))
