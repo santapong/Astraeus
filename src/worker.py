@@ -11,12 +11,25 @@ no other git command — all branch/worktree/merge plumbing belongs to the
 orchestrator (deterministic Python; no LLM touches git plumbing).
 """
 
+import os
+
 from deepagents import create_deep_agent
 from deepagents.backends import LocalShellBackend
+from langchain_openai import ChatOpenAI
 
-# A current frontier Claude model (matches deepagents' own default). Needs
-# ANTHROPIC_API_KEY at runtime. Hardcoded on purpose — no config system in Phase 0.
-DEFAULT_MODEL = "anthropic:claude-sonnet-4-6"
+# Phase 0 runtime model: Typhoon, via its OpenAI-compatible API. Hardcoded on
+# purpose — no config system in Phase 0. We build a ChatOpenAI INSTANCE (not a
+# "openai:..." string) and pass it straight into create_deep_agent: the string
+# path would apply deepagents' OpenAI "Responses API" provider profile, which
+# Typhoon does not speak; an instance is returned unchanged by resolve_model.
+# Needs TYPHOON_BASE_URL + TYPHOON_API_KEY in the environment (see src/env.py).
+def _build_typhoon_model():
+    return ChatOpenAI(
+        base_url=os.environ["TYPHOON_BASE_URL"],
+        api_key=os.environ["TYPHOON_API_KEY"],
+        model="typhoon-v2.5-30b-a3b-instruct",
+        temperature=0,
+    )
 
 ASTRA_SYSTEM_PROMPT = """You are an Astra, a worker agent in the Astraeus system.
 
@@ -37,9 +50,23 @@ Rules:
 """
 
 
-def make_astra(worktree_path, model=DEFAULT_MODEL):
-    """Build an Astra agent whose filesystem + shell are scoped to `worktree_path`."""
-    backend = LocalShellBackend(root_dir=str(worktree_path), virtual_mode=False)
+def make_astra(worktree_path, model=None):
+    """Build an Astra agent whose filesystem + shell are scoped to `worktree_path`.
+
+    `model` defaults to a fresh Typhoon client (built at call time, so it reads the
+    env AFTER .env is loaded).
+
+    `virtual_mode=True`: deepagents' filesystem tools use `/`-rooted virtual paths.
+    With virtual_mode=False those map to the REAL fs root (e.g. `/a.py` -> `C:\a.py`),
+    so the agent escapes the worktree. virtual_mode=True confines `/...` to the
+    worktree and blocks `..`/`~`. (Shell `execute` still runs with cwd=worktree.)
+    `inherit_env=True` is required: without it the `execute` shell runs with an empty
+    environment and the Astra's git/pytest calls fail with no PATH.
+    """
+    model = model or _build_typhoon_model()
+    backend = LocalShellBackend(
+        root_dir=str(worktree_path), virtual_mode=True, inherit_env=True
+    )
     return create_deep_agent(
         model=model,
         system_prompt=ASTRA_SYSTEM_PROMPT,

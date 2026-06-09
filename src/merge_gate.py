@@ -65,5 +65,11 @@ def merge_gate(branch, work_repo, test_cmd="pytest -q") -> MergeResult:
         return MergeResult(ok=False, log=tests.output)
 
     run("git checkout main", cwd=work_repo)
-    merge = run(f"git merge --no-ff {branch} -m 'merge {branch}'", cwd=work_repo)
+    # Double quotes, not single: run() uses shell=True, and Windows cmd.exe treats
+    # single quotes as literal chars (git would read 'merge / {branch}' as extra
+    # merge targets and fail). Double quotes work on both cmd.exe and /bin/sh.
+    merge = run(f'git merge --no-ff {branch} -m "merge {branch}"', cwd=work_repo)
+    if merge.exit_code != 0:
+        # a merge that didn't land must not report success (don't trust it blindly)
+        return MergeResult(ok=False, log=merge.output)
     return MergeResult(ok=True, log=merge.output)

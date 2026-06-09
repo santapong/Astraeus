@@ -20,13 +20,13 @@ Never put worktrees or agent-generated task code inside this source repo. They l
 - **No** sandboxes, Docker, Kubernetes, or E2B (Phase 1).
 - **No** config systems, plugin layers, abstractions "for later," or flexibility knobs. Hardcoded and opinionated is correct now.
 - **No** frontend, dashboard, web server, or UI.
-- Do **not** add any dependency not listed in the stack below without stopping to ask.
+- Do **not** add any dependency not listed in the stack below without stopping to ask. Declared deps: `deepagents`, `langchain-openai`, `pytest`.
 - If a requirement is ambiguous, pick the simplest reading that lets the next step run, and note the assumption in a comment.
 
 ## Tech stack — use exactly this
 - **Language:** Python 3.11+
 - **Agent harness:** `deepagents` (latest). Built on LangGraph; provides sub-agents (the `task` tool), shell/filesystem backends, and the runtime. Do not hand-roll an agent loop.
-- **Runtime model:** a current frontier **Claude** model via deepagents' `provider:model` string (e.g. `anthropic:claude-...`). Requires `ANTHROPIC_API_KEY`. This powers Astraeus and the Astra **at runtime** — separate from the Claude Code instance building this. Do not swap in a weak/local model in Phase 0.
+- **Runtime model:** **Typhoon** (`typhoon-v2.5-30b-a3b-instruct`) via its OpenAI-compatible API, built as a `langchain_openai.ChatOpenAI` instance and passed into `create_deep_agent(model=...)`. Requires `TYPHOON_BASE_URL` + `TYPHOON_API_KEY` (loaded from `.env`). This powers Astraeus and the Astra **at runtime** — separate from the Claude Code instance building this.
 - **Version control:** `git`, using **git worktrees** (one per worker branch) — inside the *work repo*.
 - **Shell execution:** deepagents' local shell backend (`execute`), scoped per worktree. No remote or sandboxed execution.
 - **Tests:** `pytest`.

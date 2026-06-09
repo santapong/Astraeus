@@ -4,14 +4,15 @@ Phase 0 / Step 1: one Astra implements add(a, b) + a test on `featW1`, then the
 merge gate lands it on `main`. All git plumbing here is deterministic Python;
 the only LLM work is the Astra writing code + its test + committing.
 
-Run (needs ANTHROPIC_API_KEY):
-    uv run python -m src.orchestrator
+Run (needs TYPHOON_BASE_URL + TYPHOON_API_KEY, loaded from .env):
+    uv run --extra dev python -m src.orchestrator
 """
 
 import subprocess
 import tempfile
 from pathlib import Path
 
+from src.env import load_dotenv_exports
 from src.merge_gate import merge_gate, run
 from src.worker import make_astra, run_astra
 
@@ -87,4 +88,5 @@ def step1():
 
 
 if __name__ == "__main__":
+    load_dotenv_exports()  # TYPHOON_* from .env into os.environ, before any model build
     step1()

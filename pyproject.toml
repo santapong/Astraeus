@@ -3,7 +3,7 @@ name = "astraeus"
 version = "0.0.0"
 description = "Astraeus Phase 0 - multi-agent orchestrator walking skeleton"
 requires-python = ">=3.11"
-dependencies = ["deepagents==0.6.8"]
+dependencies = ["deepagents==0.6.8", "langchain-openai"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
