@@ -1,66 +1,91 @@
-"""Unit tests for the merge gate. No LLM — real temp git repos only.
+"""Container/bare-origin tests for the sandboxed merge gate. No LLM — real git
+inside real containers, driven by plain Python. Requires the docker daemon and
+the astraeus-worker:phase1 image.
 
-These exercise merge_gate against a tiny WORK repo built per test: a main
-commit, a feature branch + worktree carrying a test file, then the gate.
+A trivial non-LLM driver seeds a bare origin on a throwaway volume and pushes a
+featW1 branch carrying a passing (or failing) test; merge_gate then tests it
+inside an ephemeral gate container and merges to origin's main only on green.
 """
 
 import subprocess
-from pathlib import Path
+import uuid
 
-from src.merge_gate import merge_gate, worktree_for, run
+import pytest
 
-
-def _git(cwd, *args):
-    subprocess.run(["git", "-C", str(cwd), *args], check=True,
-                   capture_output=True, text=True)
+from src.docker_backend import IMAGE
+from src.merge_gate import merge_gate
 
 
-def _make_work_repo(tmp_path: Path, branch: str, test_body: str):
-    """Build a work repo on main, then a `branch` worktree holding a test file."""
-    work_repo = tmp_path / "work"
-    work_repo.mkdir()
-    _git(work_repo, "init", "-b", "main")
-    _git(work_repo, "config", "user.email", "astra@example.com")
-    _git(work_repo, "config", "user.name", "Astra")
-    _git(work_repo, "config", "commit.gpgsign", "false")  # throwaway repo, no signing
-    (work_repo / "README").write_text("seed\n")
-    _git(work_repo, "add", "-A")
-    _git(work_repo, "commit", "-m", "init")
-
-    _git(work_repo, "branch", branch)
-    wt = tmp_path / branch  # sibling dir, outside the work repo
-    _git(work_repo, "worktree", "add", str(wt), branch)
-
-    (wt / "test_feature.py").write_text(test_body)
-    _git(wt, "add", "-A")
-    _git(wt, "commit", "-m", f"work on {branch}")
-    return work_repo, wt
+def _docker(args, check=True):
+    p = subprocess.run(["docker", *args], capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"docker {' '.join(args)} failed ({p.returncode}):\n{p.stdout}{p.stderr}")
+    return p
 
 
-def _head_subject(repo):
-    return subprocess.run(["git", "-C", str(repo), "log", "-1", "--pretty=%s"],
-                          capture_output=True, text=True).stdout.strip()
+def _docker_available():
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=15).returncode == 0
+    except Exception:
+        return False
 
 
-def test_worktree_for_finds_branch_path(tmp_path):
-    work_repo, wt = _make_work_repo(tmp_path, "featW1", "def test_ok():\n    assert True\n")
-    assert Path(worktree_for("featW1", str(work_repo))).resolve() == wt.resolve()
+# These tests spin real containers; skip cleanly if docker isn't available.
+pytestmark = pytest.mark.skipif(not _docker_available(), reason="docker daemon not available")
 
 
-def test_passing_branch_merges_to_main(tmp_path):
-    work_repo, _ = _make_work_repo(tmp_path, "featW1", "def test_ok():\n    assert True\n")
-    res = merge_gate("featW1", str(work_repo))
+def _seed_origin(volume):
+    _docker(["volume", "create", volume])
+    seed = (
+        "git init -q --bare /origin && rm -rf /tmp/seed && git clone -q /origin /tmp/seed && "
+        "cd /tmp/seed && echo seed > README && git add -A && git commit -q -m init && "
+        "git push -q origin HEAD:main"
+    )
+    _docker(["run", "--rm", "--network", "none", "-v", f"{volume}:/origin", IMAGE, "sh", "-c", seed])
+
+
+def _push_branch(volume, branch, *, passing):
+    """Non-LLM driver: clone origin, write add()+test, commit, push the branch."""
+    expect = "5" if passing else "99"  # add(2,3)==5 passes; ==99 fails deterministically
+    script = (
+        "rm -rf /tmp/w && git clone -q /origin /tmp/w && cd /tmp/w && "
+        f"git checkout -q -b {branch} && "
+        "printf 'def add(a, b):\\n    return a + b\\n' > a.py && "
+        f"printf 'from a import add\\n\\ndef test_add():\\n    assert add(2, 3) == {expect}\\n' > test_a.py && "
+        f"git add -A && git commit -q -m work && git push -q origin {branch}"
+    )
+    _docker(["run", "--rm", "--network", "none", "-v", f"{volume}:/origin", IMAGE, "sh", "-c", script])
+
+
+def _origin_main_log(volume):
+    return _docker(["run", "--rm", "--network", "none", "-v", f"{volume}:/origin",
+                    IMAGE, "git", "-C", "/origin", "log", "--oneline", "main"]).stdout.strip()
+
+
+@pytest.fixture
+def origin():
+    volume = f"astraeus_test_{uuid.uuid4().hex[:8]}"
+    _seed_origin(volume)
+    try:
+        yield volume
+    finally:
+        _docker(["volume", "rm", "-f", volume], check=False)
+
+
+def test_passing_branch_merges_to_origin_main(origin):
+    _push_branch(origin, "featW1", passing=True)
+    res = merge_gate("featW1", origin)
     assert res.ok is True
-    # the change landed on main via a --no-ff merge commit
-    assert _head_subject(work_repo) == "merge featW1"
-    assert (work_repo / "test_feature.py").exists()
+    log = _origin_main_log(origin)
+    assert "merge featW1" in log  # landed via --no-ff
 
 
-def test_failing_branch_is_rejected_and_main_unchanged(tmp_path):
-    work_repo, _ = _make_work_repo(tmp_path, "featW1", "def test_bad():\n    assert False\n")
-    before = _head_subject(work_repo)
-    res = merge_gate("featW1", str(work_repo))
+def test_failing_branch_is_rejected_and_main_untouched(origin):
+    before = _origin_main_log(origin)
+    _push_branch(origin, "featW1", passing=False)
+    res = merge_gate("featW1", origin)
     assert res.ok is False
-    assert res.log.strip() != ""          # the failure log is handed back
-    assert _head_subject(work_repo) == before  # nothing merged
-    assert not (work_repo / "test_feature.py").exists()
+    assert res.log.strip() != ""          # the pytest failure log is handed back
+    after = _origin_main_log(origin)
+    assert "merge featW1" not in after     # nothing merged
+    assert after == before                 # origin main untouched

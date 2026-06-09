@@ -1,11 +1,18 @@
-"""The automated quality gate — the one place that lands an Astra's branch on main.
+"""The automated quality gate — sandboxed (Phase 1).
 
-Operates on the WORK repo (a separate throwaway repo, never this source repo).
-All git plumbing is deterministic Python here; no LLM touches git.
+The gate spins an EPHEMERAL container, clones the bare origin, checks out the
+branch under test, and runs pytest INSIDE that container. The host never
+executes agent-written code. On green it merges to main and pushes; on red (or a
+merge conflict) it leaves origin's main untouched and hands the log back.
+
+All docker/git ops are list-form via dcmd() and check their exit codes.
 """
 
-import subprocess
 from dataclasses import dataclass
+
+from src.docker_backend import IMAGE, ORIGIN_VOLUME, dcmd
+
+GATE_CONTAINER = "astraeus_gate"
 
 
 @dataclass
@@ -14,65 +21,42 @@ class MergeResult:
     log: str = ""
 
 
-@dataclass
-class RunResult:
-    # named to read like the spec pseudocode: tests.exit_code / tests.output
-    exit_code: int
-    output: str
+def _combined(p):
+    return (p.stdout or "") + (p.stderr or "")
 
 
-def run(cmd, cwd=None) -> RunResult:
-    p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True)
-    return RunResult(p.returncode, (p.stdout or "") + (p.stderr or ""))
+def merge_gate(branch, origin_volume=ORIGIN_VOLUME, image=IMAGE):
+    """Test `branch` in a sandbox; merge to origin's main only if green.
 
-
-def log(msg):
-    # one-line sanity logging; deliberately not a logging framework (Phase 0)
-    print(msg)
-
-
-def worktree_for(branch, work_repo) -> str:
-    """Look up the worktree path the harness already created for `branch`.
-
-    This is a lookup, not creation — the orchestrator owns worktree creation.
+    Returns MergeResult(ok, log). `log` carries the gate's pytest output (on red)
+    or the merge/push failure (on a conflict), so the orchestrator can hand it back.
     """
-    out = run(f"git -C {work_repo} worktree list --porcelain").output
-    path = None
-    for line in out.splitlines():
-        if line.startswith("worktree "):
-            path = line[len("worktree "):]
-        elif line.strip() == f"branch refs/heads/{branch}":
-            return path
-    raise ValueError(f"no worktree found for branch {branch} in {work_repo}")
+    dcmd(["rm", "-f", GATE_CONTAINER], check=False)
+    dcmd(["run", "-d", "--name", GATE_CONTAINER, "--network", "none",
+          "-v", f"{origin_volume}:/origin", "-w", "/workspace", image, "sleep", "infinity"])
+    try:
+        # Orchestrator-owned git plumbing: clone the bare origin, check out the branch.
+        dcmd(["exec", GATE_CONTAINER, "git", "clone", "/origin", "/workspace"])
+        dcmd(["exec", "-w", "/workspace", GATE_CONTAINER, "git", "checkout", branch])
 
+        # Run the branch's tests INSIDE the gate container. Host never runs this code.
+        tests = dcmd(["exec", "-w", "/workspace", GATE_CONTAINER,
+                      "python", "-m", "pytest", "-q"], check=False)
+        if tests.returncode != 0:
+            return MergeResult(ok=False, log=_combined(tests))  # red → main untouched
 
-def merge_gate(branch, work_repo, test_cmd="pytest -q") -> MergeResult:
-    """Run the branch's tests in its worktree; merge to main only if green.
+        # Green → merge to main and push. list-form -m message (no shell quoting).
+        dcmd(["exec", "-w", "/workspace", GATE_CONTAINER, "git", "checkout", "main"])
+        merge = dcmd(["exec", "-w", "/workspace", GATE_CONTAINER,
+                      "git", "merge", "--no-ff", branch, "-m", f"merge {branch}"], check=False)
+        if merge.returncode != 0:
+            # e.g. a real conflict — abort cleanly so origin stays consistent.
+            dcmd(["exec", "-w", "/workspace", GATE_CONTAINER, "git", "merge", "--abort"], check=False)
+            return MergeResult(ok=False, log=_combined(merge))
+        push = dcmd(["exec", "-w", "/workspace", GATE_CONTAINER, "git", "push", "origin", "main"], check=False)
+        if push.returncode != 0:
+            return MergeResult(ok=False, log=_combined(push))
 
-    `work_repo` is explicit: the spec's signature omits it, but the gate must
-    know which repo to act on. Subtlety: tests run in the branch's worktree,
-    while `git checkout main` / `git merge` run in the work repo's MAIN tree.
-    `main` is checked out in no worktree (only featW* are), so checking it out
-    in `work_repo` is safe — do not collapse the two cwds.
-    """
-    wt = worktree_for(branch, work_repo)
-
-    log(run(f"git -C {wt} diff main..{branch}").output)  # sanity, log only
-
-    tests = run(test_cmd, cwd=wt)
-    if tests.exit_code != 0:
-        # hand the failure back to the Astra (the orchestrator decides retry)
-        return MergeResult(ok=False, log=tests.output)
-
-    checkout = run("git checkout main", cwd=work_repo)
-    if checkout.exit_code != 0:
-        # never merge onto an unknown branch if we couldn't get onto main
-        return MergeResult(ok=False, log=checkout.output)
-    # Double quotes, not single: run() uses shell=True, and Windows cmd.exe treats
-    # single quotes as literal chars (git would read 'merge / {branch}' as extra
-    # merge targets and fail). Double quotes work on both cmd.exe and /bin/sh.
-    merge = run(f'git merge --no-ff {branch} -m "merge {branch}"', cwd=work_repo)
-    if merge.exit_code != 0:
-        # a merge that didn't land must not report success (don't trust it blindly)
-        return MergeResult(ok=False, log=merge.output)
-    return MergeResult(ok=True, log=merge.output)
+        return MergeResult(ok=True, log=_combined(tests))
+    finally:
+        dcmd(["rm", "-f", GATE_CONTAINER], check=False)
