@@ -64,7 +64,10 @@ def merge_gate(branch, work_repo, test_cmd="pytest -q") -> MergeResult:
         # hand the failure back to the Astra (the orchestrator decides retry)
         return MergeResult(ok=False, log=tests.output)
 
-    run("git checkout main", cwd=work_repo)
+    checkout = run("git checkout main", cwd=work_repo)
+    if checkout.exit_code != 0:
+        # never merge onto an unknown branch if we couldn't get onto main
+        return MergeResult(ok=False, log=checkout.output)
     # Double quotes, not single: run() uses shell=True, and Windows cmd.exe treats
     # single quotes as literal chars (git would read 'merge / {branch}' as extra
     # merge targets and fail). Double quotes work on both cmd.exe and /bin/sh.

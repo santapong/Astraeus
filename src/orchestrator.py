@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from src.decompose import decompose
 from src.env import load_dotenv_exports
 from src.merge_gate import merge_gate, run
 from src.worker import make_astra, run_astra
@@ -87,6 +88,54 @@ def step1():
     return work_repo, ok
 
 
+def _tree_contains(repo, *needles):
+    """True if any .py file in the work repo's main tree contains every needle."""
+    blob = "".join(p.read_text(errors="ignore") for p in Path(repo).glob("*.py"))
+    return all(n in blob for n in needles)
+
+
+def step2():
+    """Decompose one task into TWO file-disjoint subtasks; two Astras land both on main."""
+    task = "Write add(a, b) with a test, and mul(a, b) with a test."
+
+    # Plan: one Typhoon call -> exactly two validated, file-disjoint subtasks.
+    # Fails fast (prints raw output + raises) BEFORE any work repo is created.
+    print(f"[astraeus] decomposing task: {task!r}")
+    subtasks = decompose(task)
+    for s in subtasks:
+        print(f"[astraeus]   {s['branch']}: files={s['files']}")
+
+    work_repo, worktrees = bootstrap_work_repo(["featW1", "featW2"])
+    print(f"[astraeus] work repo: {work_repo}")
+
+    # Dispatch both Astras SEQUENTIALLY — each scoped to its own worktree.
+    for sub in subtasks:
+        branch = sub["branch"]
+        print(f"[astraeus] dispatching Astra on {branch} ...")
+        astra = make_astra(worktrees[branch])
+        run_astra(astra, sub["instruction"])
+
+    # Gate both branches SEQUENTIALLY. Disjoint files -> no merge conflict.
+    for branch in ("featW1", "featW2"):
+        print(f"[astraeus] running merge gate on {branch} ...")
+        result = merge_gate(branch, str(work_repo))
+        if not result.ok:
+            print(f"[astraeus] FAILED: gate rejected {branch}\n" + result.log)
+            return work_repo, False
+
+    # Verify on main (post-merge), per Definition of Done.
+    log = run("git log --oneline", cwd=str(work_repo)).output.strip()
+    green = _pytest_green(work_repo)
+    landed = _tree_contains(work_repo, "def add(", "def mul(")
+    print("[astraeus] main git log:\n" + log)
+    print(f"[astraeus] pytest on main green? {green}")
+    print(f"[astraeus] main tree has both add and mul? {landed}")
+    ok = (green and landed
+          and "merge featW1" in log and "merge featW2" in log)
+    print("[astraeus] STEP 2 " + ("PASS" if ok else "FAIL"))
+    return work_repo, ok
+
+
 if __name__ == "__main__":
     load_dotenv_exports()  # TYPHOON_* from .env into os.environ, before any model build
-    step1()
+    step2()
