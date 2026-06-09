@@ -29,6 +29,10 @@ def _build_typhoon_model():
         api_key=os.environ["TYPHOON_API_KEY"],
         model="typhoon-v2.5-30b-a3b-instruct",
         temperature=0,
+        # Fail fast on a stalled connection instead of hanging on the openai
+        # client's ~10-minute default; a few bounded retries cover transient blips.
+        timeout=60,
+        max_retries=2,
     )
 
 ASTRA_SYSTEM_PROMPT = """You are an Astra, a worker agent in the Astraeus system.
