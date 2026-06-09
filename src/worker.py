@@ -11,8 +11,12 @@ never holds the API key (model calls run in this host process).
 """
 
 import os
+import time
 
 from deepagents import create_deep_agent
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_openai import ChatOpenAI
 
 from src.docker_backend import DockerSandbox
@@ -70,3 +74,25 @@ def make_astra(container, model=None):
 def run_astra(agent, instruction):
     """Dispatch one instruction to an Astra and return the final state."""
     return agent.invoke({"messages": instruction})
+
+
+class SleepyModel(BaseChatModel):
+    """Deterministic stall stub: every generation blocks for `sleep_seconds`.
+
+    Used ONLY by the Step 3 timeout test to force one worker to hang, proving the
+    per-Astra wall-clock cap bounds a hung model call (the Phase-0 19-minute freeze
+    cannot recur). Not used in any real run.
+    """
+
+    sleep_seconds: int = 600
+
+    @property
+    def _llm_type(self):
+        return "sleepy-stub"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        time.sleep(self.sleep_seconds)
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=""))])
+
+    def bind_tools(self, tools, **kwargs):
+        return self  # accept tool binding, ignore — the call sleeps before any tool use

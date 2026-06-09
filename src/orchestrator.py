@@ -11,10 +11,13 @@ Run (needs TYPHOON_BASE_URL + TYPHOON_API_KEY from .env, and a running docker da
     uv run --extra dev python -m src.orchestrator
 """
 
+import threading
+import time
+
 from src.docker_backend import IMAGE, ORIGIN_VOLUME, dcmd
 from src.env import load_dotenv_exports
 from src.merge_gate import merge_gate
-from src.worker import make_astra, run_astra
+from src.worker import SleepyModel, make_astra, run_astra
 
 WORKER_CONTAINER = "astraeus_w1"
 
@@ -271,6 +274,194 @@ def step2():
     return ok
 
 
+# --- Step 3: concurrency + deterministic stall ------------------------------
+
+ASTRA_CAP_SECONDS = 300  # hard per-Astra wall-clock cap (production default)
+
+
+def origin_branches():
+    """Branch refs present on origin, read via a throwaway container."""
+    return dcmd(["run", "--rm", "--network", "none", "-v", f"{ORIGIN_VOLUME}:/origin",
+                 IMAGE, "git", "-C", "/origin", "branch"]).stdout.strip()
+
+
+def run_parallel(subtasks, cap):
+    """Run each subtask's Astra in its OWN daemon thread, concurrently, under a
+    shared wall-clock `cap`. A thread still alive at the cap is a stall: its branch
+    is FAILED and its container is rm -f'd (the lever — a Python thread can't be
+    force-killed; killing the container unblocks any in-flight docker exec, and
+    daemon=True lets the process exit even while the thread is still blocked).
+
+    Returns (timeline, outcomes) where outcomes[branch] is "READY"/"FAILED_TIMEOUT"/
+    "FAILED_ERROR".
+    """
+    for s in subtasks:
+        start_worker(s["worker"], s["branch"])
+
+    timeline, lock, done, threads = [], threading.Lock(), {}, {}
+
+    def record(branch, event):
+        with lock:
+            timeline.append((time.monotonic(), branch, event))
+
+    def work(s):
+        b = s["branch"]
+        record(b, "thread start")
+        try:
+            astra = make_astra(s["worker"], s.get("model"))
+            record(b, "astra dispatch begin")
+            run_astra(astra, s["instruction"])
+            record(b, "astra dispatch end (committed)")
+            push_branch(s["worker"], b)
+            record(b, "pushed branch")
+            done[b] = True
+        except Exception as e:  # noqa: BLE001 — a worker failure must not crash the run
+            record(b, f"ERROR {type(e).__name__}: {e}")
+            done[b] = False
+
+    start = time.monotonic()
+    for s in subtasks:
+        t = threading.Thread(target=work, args=(s,), daemon=True)  # Amendment 5: daemon
+        threads[s["branch"]] = t
+        t.start()
+
+    deadline = start + cap
+    for t in threads.values():
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    outcomes = {}
+    for s in subtasks:
+        b = s["branch"]
+        if threads[b].is_alive():
+            record(b, f"TIMEOUT at cap={cap}s -> FAILED (container rm -f'd, thread abandoned)")
+            dcmd(["rm", "-f", s["worker"]], check=False)
+            outcomes[b] = "FAILED_TIMEOUT"
+        else:
+            outcomes[b] = "READY" if done.get(b) else "FAILED_ERROR"
+    return timeline, outcomes, start
+
+
+def _print_timeline(timeline, start, label):
+    print(f"\n[astraeus] {label} - per-thread timeline (+seconds from start, interleaved):")
+    for t, b, ev in sorted(timeline):
+        print(f"    +{t - start:7.2f}s [{b}] {ev}")
+    spans = {}
+    for t, b, ev in timeline:
+        if ev == "astra dispatch begin":
+            spans.setdefault(b, [None, None])[0] = t
+        elif ev.startswith("astra dispatch end"):
+            spans.setdefault(b, [None, None])[1] = t
+    ended = {b: s for b, s in spans.items() if s[0] is not None and s[1] is not None}
+    if len(ended) == 2:
+        (b1, s1), (b2, s2) = ended.items()
+        overlap = min(s1[1], s2[1]) - max(s1[0], s2[0])
+        if overlap > 0:
+            print(f"[astraeus] TRUE OVERLAP: {b1} and {b2} were dispatching simultaneously "
+                  f"for {overlap:.2f}s (not sequential).")
+        else:
+            print("[astraeus] NOTE: dispatch intervals did not overlap.")
+
+
+SUBTASK_A = {"branch": "featW1", "worker": "astraeus_w1",
+             "instruction": (
+                 "Implement a function add(a, b) that returns a + b in /workspace/a.py. "
+                 "Write a pytest test in /workspace/test_a.py that does `from a import add` "
+                 "and asserts add(2, 3) == 5. Then commit.")}
+SUBTASK_B = {"branch": "featW2", "worker": "astraeus_w2",
+             "instruction": (
+                 "Implement a function mul(a, b) that returns a * b in /workspace/b.py. "
+                 "Write a pytest test in /workspace/test_b.py that does `from b import mul` "
+                 "and asserts mul(2, 3) == 6. Then commit.")}
+
+
+def _gate_ready(subtasks, outcomes):
+    """Gate the READY branches sequentially (disjoint files => clean merges)."""
+    landed, logs = [], {}
+    for s in subtasks:
+        b = s["branch"]
+        if outcomes[b] != "READY":
+            print(f"[astraeus] skipping gate for {b} (outcome={outcomes[b]})")
+            continue
+        print(f"[astraeus] gate {b} ...")
+        r = merge_gate(b)
+        logs[b] = r.log
+        if r.ok:
+            landed.append(b)
+            print(f"[astraeus] {b} landed. gate pytest (in-container):\n" + r.log.strip())
+        else:
+            print(f"[astraeus] {b} REJECTED by gate:\n" + r.log)
+    return landed, logs
+
+
+def step3():
+    """Part A — parallel happy path: two file-disjoint Astras run concurrently."""
+    reset_origin_volume()
+    print(f"[astraeus] seeded bare origin on volume {ORIGIN_VOLUME!r}")
+    subtasks = [SUBTASK_A, SUBTASK_B]
+    print("[astraeus] file-disjoint subtasks: featW1 -> a.py/test_a.py ; featW2 -> b.py/test_b.py")
+
+    try:
+        timeline, outcomes, start = run_parallel(subtasks, cap=ASTRA_CAP_SECONDS)
+        _print_timeline(timeline, start, "PART A (parallel)")
+        print(f"[astraeus] outcomes: {outcomes}")
+        print("[astraeus] both branch refs on origin (concurrent-push safety):\n" + origin_branches())
+        landed, _ = _gate_ready(subtasks, outcomes)
+    finally:
+        for s in subtasks:
+            dcmd(["rm", "-f", s["worker"]], check=False)
+        print("[astraeus] removed worker containers")
+
+    log = origin_main_log()
+    both = ("merge featW1" in log) and ("merge featW2" in log)
+    print("\n[astraeus] final origin main log:\n" + log)
+    print("[astraeus] origin volume survived: " + volume_inspect_oneliner())
+    ok = both and set(landed) == {"featW1", "featW2"}
+    print("\n[astraeus] STEP 3 PART A " + ("PASS (both landed, ran concurrently)" if ok else "FAIL"))
+    return ok
+
+
+def step3_stall(cap=75, sleep_seconds=600):
+    """Part B — deterministic stall: one worker hangs (SleepyModel); the cap bounds
+    it, the other branch still lands, the process exits cleanly (no 19-minute freeze).
+    """
+    reset_origin_volume()
+    print(f"[astraeus] seeded bare origin on volume {ORIGIN_VOLUME!r}")
+    # featW1 = real Typhoon worker (must land); featW2 = stalled stub (must time out).
+    stalled = dict(SUBTASK_B, model=SleepyModel(sleep_seconds=sleep_seconds))
+    subtasks = [SUBTASK_A, stalled]
+    print(f"[astraeus] featW1 = real Astra ; featW2 = SleepyModel(sleep={sleep_seconds}s) ; cap={cap}s")
+
+    t0 = time.monotonic()
+    try:
+        timeline, outcomes, start = run_parallel(subtasks, cap=cap)
+        _print_timeline(timeline, start, "PART B (stall)")
+        print(f"[astraeus] outcomes: {outcomes}")
+        landed, _ = _gate_ready(subtasks, outcomes)
+    finally:
+        for s in subtasks:
+            dcmd(["rm", "-f", s["worker"]], check=False)
+        print("[astraeus] removed worker containers")
+
+    elapsed = time.monotonic() - t0
+    log = origin_main_log()
+    print("\n[astraeus] final origin main log:\n" + log)
+    print("[astraeus] origin volume survived: " + volume_inspect_oneliner())
+    print(f"[astraeus] total wall time: {elapsed:.1f}s (cap={cap}s; the stalled "
+          f"SleepyModel would have run {sleep_seconds}s - proof the cap bounds the hang)")
+    ok = (outcomes.get("featW2") == "FAILED_TIMEOUT"
+          and "featW1" in landed and "merge featW1" in log
+          and elapsed < sleep_seconds)
+    print("\n[astraeus] STEP 3 PART B " + (
+        "PASS (stalled branch FAILED at the cap; other branch landed; clean exit)"
+        if ok else "FAIL"))
+    return ok
+
+
 if __name__ == "__main__":
+    import sys
+
     load_dotenv_exports()  # TYPHOON_* from .env into os.environ, before any model build
-    step2()
+    if "--stall" in sys.argv:
+        step3_stall()
+    else:
+        step3()
