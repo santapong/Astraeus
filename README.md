@@ -94,13 +94,39 @@ Typhoon via its OpenAI-compatible API.
    The work repo is a throwaway temporary git repo created at runtime; nothing is
    written into this source tree.
 
+## Phase 1 — harden the unit
+
+Phase 1 makes the unit survive reality. Workers **and** the merge gate now run inside
+ephemeral Docker containers, so the **host never executes agent-written code** (the
+gate runs `pytest` in its own container); every container runs `--network none` and is
+torn down in `finally`; the **API key never enters a container** (model calls happen on
+the host — asserted); git worktrees are retired for a **bare origin on a named docker
+volume** (no host↔container path translation, concurrent pushes safe); the two workers
+run **in parallel**; and a hung model call **can't freeze a run** — each worker is
+bounded by a wall-clock cap. Live proof: a deliberate 600-second stall was **capped at
+75s and the other branch still landed** (total wall 92.6s), so Phase 0's 19-minute
+freeze is impossible by construction.
+
+**Documented capability boundary (stated plainly):** the free worker model
+(`typhoon-v2.5-30b-a3b`) **cannot resolve a real merge conflict** — not even add/add,
+and not even when handed an explicit worked example. We proved this across three live
+runs with three distinct failure modes, under fixed honesty rules (one handback, two
+gate runs max, no human resolution, no model swap), and a pre-registered one-shot
+trial that **failed**. When a conflict can't be resolved, the gate **refuses to merge
+and the branch is reported FAILED** — `main` stays consistent and nothing broken
+lands. A mapped boundary with the honesty rules held is a result, not a gap; see
+[docs/phase1-findings.md](docs/phase1-findings.md).
+
 ## Status
 
-**Phase 0 — the walking skeleton — is complete** (tag `v0.1.0-phase0`). It proves the
-loop: decompose → two Astras in worktrees → merge gate → reject/retry-once → land on
-`main`, on a free model, with no human git.
+**Phase 0 — walking skeleton — complete** (tag `v0.1.0-phase0`): decompose → two Astras
+in worktrees → merge gate → reject/retry-once → land on `main`, on a free model, no
+human git. Findings: [docs/phase0-findings.md](docs/phase0-findings.md).
 
-**Phase 1 (sandboxing / hardening) has not started.** This runs **locally with no
-isolation** — workers get a real shell with your environment. **Do not run untrusted
-tasks.** Design inputs harvested from running Phase 0 are recorded in
-[docs/phase0-findings.md](docs/phase0-findings.md).
+**Phase 1 — hardened unit — complete** (tag `v0.2.0-phase1`): sandboxed workers + gate,
+`--network none`, key never in containers, bare origin volume, parallel workers, hangs
+bounded by construction, conflict-resolution boundary mapped. Findings:
+[docs/phase1-findings.md](docs/phase1-findings.md).
+
+**Phase 2 has not started.** Workers are sandboxed in Docker now, but treat this as a
+local development tool, not a hardened multi-tenant service.

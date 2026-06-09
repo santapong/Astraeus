@@ -1,8 +1,11 @@
 # CLAUDE.md — Astraeus (Phase 0)
 
-> **STATUS: Phase 0 COMPLETE (2026-06, tag `v0.1.0-phase0`).** The spec below is the
-> historical Phase 0 binding spec — do **NOT** re-build it. Phase 1 spec: TBD, see
-> [docs/phase0-findings.md](docs/phase0-findings.md).
+> **STATUS: Phase 1 COMPLETE (2026-06, tag `v0.2.0-phase1`).** Phase 0 is sealed at
+> `v0.1.0-phase0`. The Phase 0 binding spec below is **historical** — do **NOT**
+> re-build it; Phase 1 (sandboxed workers + gate, `--network none`, bounded hangs,
+> bare-origin volume, conflict boundary mapped) is likewise complete and historical.
+> Findings: [docs/phase0-findings.md](docs/phase0-findings.md) +
+> [docs/phase1-findings.md](docs/phase1-findings.md). **Phase 2 spec: TBD.**
 
 ## What Astraeus is
 A multi-agent system where an orchestrator (**Astraeus**) plans a task, splits it among worker agents (**the Astra** — the stars), and lands their work on `main` through an automated quality gate — **with no human touching git.**
