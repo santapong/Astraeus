@@ -103,3 +103,31 @@ def test_owner_for_failure_no_substring_false_match():
     assert o._owner_for_failure("E   test_aa.py::t failed in aa.py", subs)["id"] == "w2"
     assert o._owner_for_failure("E   test_a.py::t failed", subs)["id"] == "w1"
     assert o._owner_for_failure("no python files mentioned", subs) is None
+
+
+def test_handback_asks_for_reflection():
+    # Reflexion: the worker must reflect before fixing, not blindly re-run.
+    assert "reflect" in o.RED_TEST_HANDBACK_MSG.lower()
+
+
+def test_extract_reflection_from_state():
+    state = {"messages": [
+        {"role": "user", "content": "fix it"},
+        {"role": "assistant", "content": "Expected 5 but got 4; I will fix add()."}]}
+    assert "Expected 5" in o._extract_reflection(state)
+    assert o._extract_reflection({}) == ""              # missing/odd state -> '' (no raise)
+    assert o._extract_reflection({"messages": []}) == ""
+
+
+def test_on_repair_receives_reflection(monkeypatch):
+    monkeypatch.setattr(o, "_repair", lambda *a, **k: "expected 5 got 4; will fix add")
+    monkeypatch.setattr(o, "push_candidate", lambda *a, **k: None)
+    seq = [MergeResult(ok=False, log="E   test_a.py::t failed"), MergeResult(ok=True, log="ok")]
+    monkeypatch.setattr(o, "merge_gate", lambda *a, **k: seq.pop(0))
+
+    repairs = []
+    landed, attempts, _, gate_state = o._gate_with_repair(
+        _subtasks(), [], max_attempts=2,
+        on_repair=lambda oid, att, refl: repairs.append((oid, att, refl)))
+    assert landed is True and gate_state == "landed"
+    assert repairs == [("w1", 1, "expected 5 got 4; will fix add")]   # owner, attempt, reflection

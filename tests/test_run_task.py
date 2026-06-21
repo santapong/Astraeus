@@ -167,3 +167,19 @@ def test_emit_hook_receives_events_and_is_optional(monkeypatch):
     events.clear()
     o.run_task("t")                      # emit unset -> no events, no error
     assert events == []
+
+
+def test_run_task_records_repairs_in_transcript(monkeypatch):
+    seeded, rounds_seen = {}, []
+    _patch_common(monkeypatch, seeded, rounds_seen)
+    monkeypatch.setattr(o, "decompose", lambda task: PLAN)
+    seq = [MergeResult(ok=False, log="E   a.py::t failed"), MergeResult(ok=True, log="ok")]
+    monkeypatch.setattr(o, "merge_gate", lambda *a, **k: seq.pop(0))
+    monkeypatch.setattr(o, "_repair", lambda *a, **k: "expected 5 got 4; fixing add")
+
+    result = o.run_task("t")
+    assert result["gate_state"] == "landed"
+    assert len(result["repairs"]) == 1
+    assert result["repairs"][0]["owner_id"] == "w1"          # owns a.py
+    assert result["repairs"][0]["reflection"] == "expected 5 got 4; fixing add"
+    assert json.loads(seeded[".astraeus/run.json"])["repairs"][0]["owner_id"] == "w1"

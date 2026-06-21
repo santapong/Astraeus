@@ -673,8 +673,10 @@ DEFAULT_TASK = ("Write a function add(a, b) that returns a + b with a pytest tes
 RED_TEST_HANDBACK_MSG = (
     "The test suite is failing and your file(s) {files} are involved. Here is the "
     "pytest output:\n\n{log}\n\n"
-    "Fix your file(s) so the tests pass. Edit ONLY {files}. Do NOT run git. When the "
-    "logic is correct, stop — the orchestrator will re-run the tests."
+    "FIRST, in one or two sentences, reflect on the failure: what the test expected, "
+    "what your code actually did, and what you will change. THEN fix your file(s) so the "
+    "tests pass. Edit ONLY {files}. Do NOT run git. When the logic is correct, stop — "
+    "the orchestrator will re-run the tests."
 )
 
 
@@ -697,29 +699,50 @@ def _owner_for_failure(log, subtasks):
     return None
 
 
+def _extract_reflection(state, limit=300):
+    """Best-effort: the worker's last assistant message (its stated reflection), trimmed.
+    Never raises — a missing/odd state just yields ''."""
+    try:
+        messages = state.get("messages", []) if isinstance(state, dict) else []
+        for m in reversed(messages):
+            content = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+            if isinstance(content, list):  # some providers return content as parts
+                content = " ".join(
+                    str(p.get("text", p)) if isinstance(p, dict) else str(p) for p in content)
+            if content and str(content).strip():
+                return str(content).strip().replace("\n", " ")[:limit]
+    except Exception:  # noqa: BLE001 — reflection capture must never break a run
+        pass
+    return ""
+
+
 def _repair(owner, plan, log, workspace_volume=WORKSPACE_VOLUME):
-    """Spin a fresh shared worker for the owning subtask, hand back its pytest failure
-    so it fixes its own file in the shared tree, then the orchestrator commits."""
+    """Spin a fresh shared worker for the owning subtask, hand back its pytest failure so
+    it reflects then fixes its own file in the shared tree; the orchestrator commits.
+    Returns the worker's reflection text (best-effort, '' if unavailable)."""
     start_shared_worker(owner["worker"], workspace_volume=workspace_volume)
+    reflection = ""
     try:
         harness = _build_harness(owner, plan)
         msg = RED_TEST_HANDBACK_MSG.format(files=", ".join(owner["files"]), log=log[-4000:])
         astra = make_astra(owner["worker"], system_prompt=ASTRA_SHARED_SYSTEM_PROMPT, harness=harness)
-        run_astra(astra, msg)
+        reflection = _extract_reflection(run_astra(astra, msg))
     finally:
         commit_workspace(f"astraeus: repair {owner['id']}", workspace_volume=workspace_volume)
         dcmd(["rm", "-f", owner["worker"]], check=False)
+    return reflection
 
 
 def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE_VOLUME,
-                      progress=None):
+                      progress=None, on_repair=None):
     """Gate the integrated tree (already pushed as `candidate`); on a RED TEST hand it
     back to the owning worker, bounded by max_attempts. Conflicts cannot occur (one
     integrated tree), so the only failure mode is a red test — which Typhoon can
     self-repair. Returns (landed, attempts, log, gate_state) where gate_state is one
     of "landed", "retry_exhausted", "repair_no_owner", "conflict" — the explicit
     terminal state of the loop, so the transcript records WHY it stopped. `progress`,
-    if given, is called (attempts, log, interim_state) after each gate run for live UIs.
+    if given, is called (attempts, log, interim_state) after each gate run; `on_repair`,
+    if given, is called (owner_id, attempt, reflection) after each handback.
     """
     r = merge_gate("candidate")
     attempts = 1
@@ -735,7 +758,9 @@ def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE
         print(f"[astraeus] gate red -> handback to {owner['id']} "
               f"(repair {attempts}/{max_attempts - 1})")
         emit("gate", owner["id"], "handback")
-        _repair(owner, plan, r.log, workspace_volume=workspace_volume)
+        reflection = _repair(owner, plan, r.log, workspace_volume=workspace_volume)
+        if on_repair:
+            on_repair(owner["id"], attempts, reflection)
         push_candidate(workspace_volume=workspace_volume)
         r = merge_gate("candidate")
         attempts += 1
@@ -749,7 +774,7 @@ def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE
 
 
 def _build_result(task, plan, rounds, outcomes, timeline, t0, landed=False,
-                  attempts=0, gate_log="", gate_state="running", origin_log=""):
+                  attempts=0, gate_log="", gate_state="running", origin_log="", repairs=None):
     """Assemble the run.json result dict from current run state. Used for the final
     transcript AND for live partial re-flushes during a run (defaults describe a run
     still in progress: gate_state='running')."""
@@ -761,6 +786,7 @@ def _build_result(task, plan, rounds, outcomes, timeline, t0, landed=False,
         "gate_attempts": attempts,
         "landed": landed,
         "gate_state": gate_state,
+        "repairs": repairs or [],
         "gate_log": gate_log,
         "origin_log": origin_log,
         "timeline": [{"t": round(t - t0, 3), "id": b, "event": e}
@@ -821,7 +847,7 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
     print("[astraeus] schedule: " + " | ".join(
         "+".join(s["id"] for s in r) for r in rounds))
 
-    timeline_all, outcomes_all, t0 = [], {}, time.monotonic()
+    timeline_all, outcomes_all, repairs_all, t0 = [], {}, [], time.monotonic()
     try:
         for rn, rnd in enumerate(rounds):
             print(f"[astraeus] round {rn + 1}/{len(rounds)}: {[s['id'] for s in rnd]}")
@@ -837,7 +863,8 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
                     _discard_worker_changes(s, workspace_volume=workspace_volume)
             commit_workspace(f"astraeus: round {rn + 1}", workspace_volume=workspace_volume)
             # Live snapshot for the TUI tail (written to the tree, committed with the next round).
-            flush_transcript(_build_result(task, plan, rounds, outcomes_all, timeline_all, t0),
+            flush_transcript(_build_result(task, plan, rounds, outcomes_all, timeline_all, t0,
+                                           repairs=repairs_all),
                              workspace_volume=workspace_volume)
             for s in rnd:
                 dcmd(["rm", "-f", s["worker"]], check=False)
@@ -853,17 +880,22 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
         # Live snapshot during gating so the TUI tail sees repair attempts as they happen.
         flush_transcript(_build_result(task, plan, rounds, outcomes_all, timeline_all, t0,
                                        landed=(gate_state == "landed"), attempts=attempts,
-                                       gate_log=gate_log, gate_state=gate_state),
+                                       gate_log=gate_log, gate_state=gate_state,
+                                       repairs=repairs_all),
                          workspace_volume=workspace_volume)
+
+    def _on_repair(owner_id, attempt, reflection):
+        # Reflexion: record the worker's self-reflection for each bounded repair attempt.
+        repairs_all.append({"owner_id": owner_id, "attempt": attempt, "reflection": reflection})
 
     landed, attempts, gate_log, gate_state = _gate_with_repair(
         subtasks, plan, max_attempts=max_attempts, workspace_volume=workspace_volume,
-        progress=_progress)
+        progress=_progress, on_repair=_on_repair)
 
     origin_log = origin_main_log()
     result = _build_result(task, plan, rounds, outcomes_all, timeline_all, t0,
                            landed=landed, attempts=attempts, gate_log=gate_log,
-                           gate_state=gate_state, origin_log=origin_log)
+                           gate_state=gate_state, origin_log=origin_log, repairs=repairs_all)
     write_transcript(result, workspace_volume=workspace_volume)
     emit("done", "run", {"landed": landed, "gate_state": gate_state, "attempts": attempts})
     print(f"[astraeus] run_task done: landed={landed} gate_state={gate_state} gate_attempts={attempts}")

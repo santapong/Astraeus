@@ -244,6 +244,7 @@ class MergeResult:
   "outcomes": {"w1": "READY", "w3": "FAILED_TIMEOUT"},
   "gate_attempts": int, "landed": bool,
   "gate_state": str,   # landed | retry_exhausted | repair_no_owner | conflict
+  "repairs": [{"owner_id": str, "attempt": int, "reflection": str}],
   "gate_log": str, "origin_log": str,
   "timeline": [{"t": 0.12, "id": "w1", "event": "astra dispatch begin"}, ...] }
 ```
