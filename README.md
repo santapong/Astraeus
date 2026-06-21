@@ -117,6 +117,44 @@ and the branch is reported FAILED** — `main` stays consistent and nothing brok
 lands. A mapped boundary with the honesty rules held is a result, not a gap; see
 [docs/phase1-findings.md](docs/phase1-findings.md).
 
+## Phase 2 — a central collaborative workspace
+
+Phase 2 gives every worker **one shared filesystem** instead of an isolated silo. A new
+docker volume `astraeus_workspace` is a live git checkout mounted at `/workspace` in
+**every** Astra, so a worker can read and build on another's code — the central file
+system all sandboxes interact with. The loop becomes a real `run_task(task)`:
+
+```mermaid
+flowchart TD
+    T["task"] --> D["decompose<br/>1 Typhoon call → 2..N subtasks (files may overlap)"]
+    D --> S["schedule into rounds<br/>disjoint files → parallel · shared files → sequenced"]
+    S --> R1["round 1 · Astra write into the SHARED tree"]
+    R1 --> C1["orchestrator commits the tree"]
+    C1 --> R2["round 2 · later writer reads the committed file (no merge)"]
+    R2 --> C2["orchestrator commits + pushes one `candidate`"]
+    C2 --> G{"merge_gate<br/>full suite in a fresh container"}
+    G -->|green| M["main"]
+    G -->|"red test → hand log back to the owner (bounded)"| R2
+```
+
+The Phase 1 **conflict boundary is respected by design, not by the model**: same-file
+work is *sequenced* (each later writer does read-modify-write on the prior commit), so
+git never has to 3-way-merge — the only gate failure left is a red test, which the model
+can self-repair. The gate never mounts the shared volume, so its verdict stays a pure
+function of committed code (the integrated tree is gated as one `candidate`, which makes
+the gate run the **union** of every worker's tests). Workers run **no git** at all now;
+the orchestrator is the sole committer (a shared `.git` cannot take concurrent commits).
+
+New entrypoints:
+
+```
+uv run --extra dev python -m src.orchestrator --run "Write add(a,b) + test, and mul(a,b) + test."
+uv run --extra dev python -m src.orchestrator --shared-demo   # two workers collaborate on ONE file
+```
+
+Each run persists `/workspace/.astraeus/run.json` (plan, rounds, outcomes, gate
+attempts, timeline) on the workspace volume for inspection.
+
 ## Status
 
 **Phase 0 — walking skeleton — complete** (tag `v0.1.0-phase0`): decompose → two Astras
@@ -128,5 +166,11 @@ human git. Findings: [docs/phase0-findings.md](docs/phase0-findings.md).
 bounded by construction, conflict-resolution boundary mapped. Findings:
 [docs/phase1-findings.md](docs/phase1-findings.md).
 
-**Phase 2 has not started.** Workers are sandboxed in Docker now, but treat this as a
-local development tool, not a hardened multi-tenant service.
+**Phase 2 — central collaborative workspace — implemented.** Shared `/workspace` volume
+across all sandboxes, N-worker `run_task` loop on `decompose`, orchestrator-sequenced
+same-file edits (no merges), bounded red-test repair, harness-aware Astra, JSON
+transcript. The orchestration logic is unit-tested (`30 passed`); the docker-gated
+plumbing tests and the live model-driven runs (`--run`, `--shared-demo`) require a host
+with Docker + Typhoon and are pending. Design & status:
+[docs/phase2-findings.md](docs/phase2-findings.md). Treat this as a local development
+tool, not a hardened multi-tenant service.

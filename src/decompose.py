@@ -9,6 +9,7 @@ model output and raise (no retry — that is Step 3).
 import json
 from pathlib import Path
 
+from src.docker_backend import MAX_WORKERS
 from src.worker import _build_typhoon_model
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "decompose.md"
@@ -65,36 +66,40 @@ def _extract_json_array(text):
 
 
 def _validate(subtasks):
-    """Enforce the Step-2 contract; raise DecomposeError on any violation."""
-    if not isinstance(subtasks, list) or len(subtasks) != 2:
-        raise DecomposeError(f"expected a list of exactly 2 subtasks, got {subtasks!r}")
+    """Enforce the Phase 2 contract; raise DecomposeError on any violation.
 
-    branches = []
-    file_sets = []
+    Phase 2 relaxes Phase 0/1's "exactly two, file-disjoint" rule: 2..MAX_WORKERS
+    subtasks are allowed and they MAY share files (the orchestrator sequences
+    same-file work so git never has to merge). Each subtask carries a unique `id`.
+    """
+    if not isinstance(subtasks, list) or not (2 <= len(subtasks) <= MAX_WORKERS):
+        raise DecomposeError(
+            f"expected a list of 2..{MAX_WORKERS} subtasks, got {subtasks!r}")
+
+    ids = []
     for item in subtasks:
         if not isinstance(item, dict):
             raise DecomposeError(f"subtask is not an object: {item!r}")
-        for key in ("branch", "files", "instruction"):
+        for key in ("id", "files", "instruction"):
             if key not in item:
                 raise DecomposeError(f"subtask missing '{key}': {item!r}")
+        if not isinstance(item["id"], str) or not item["id"].strip():
+            raise DecomposeError(f"'id' must be a non-empty string: {item!r}")
         files = item["files"]
-        if not isinstance(files, list) or not files or not all(isinstance(f, str) for f in files):
-            raise DecomposeError(f"'files' must be a non-empty list of strings: {item!r}")
+        if not isinstance(files, list) or not files or not all(
+                isinstance(f, str) and f.strip() for f in files):
+            raise DecomposeError(f"'files' must be a non-empty list of non-empty strings: {item!r}")
         if not isinstance(item["instruction"], str) or not item["instruction"].strip():
             raise DecomposeError(f"'instruction' must be a non-empty string: {item!r}")
-        branches.append(item["branch"])
-        file_sets.append({f.lower() for f in files})  # lowercase: Windows is case-insensitive
+        ids.append(item["id"])
 
-    if set(branches) != {"featW1", "featW2"} or len(branches) != 2:
-        raise DecomposeError(f"branches must be exactly featW1 and featW2, got {branches!r}")
-    shared = file_sets[0] & file_sets[1]
-    if shared:
-        raise DecomposeError(f"files must be disjoint across subtasks; shared: {sorted(shared)}")
+    if len(set(ids)) != len(ids):
+        raise DecomposeError(f"subtask ids must be unique, got {ids!r}")
     return subtasks
 
 
 def decompose(task, model=None):
-    """Split `task` into exactly two file-disjoint subtasks (validated)."""
+    """Split `task` into 2..MAX_WORKERS subtasks (validated). Files may overlap."""
     model = model or _build_typhoon_model()
     prompt = _PROMPT_PATH.read_text().replace("{task}", task)
 

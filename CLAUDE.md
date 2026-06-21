@@ -1,11 +1,15 @@
 # CLAUDE.md — Astraeus (Phase 0)
 
-> **STATUS: Phase 1 COMPLETE (2026-06, tag `v0.2.0-phase1`).** Phase 0 is sealed at
-> `v0.1.0-phase0`. The Phase 0 binding spec below is **historical** — do **NOT**
-> re-build it; Phase 1 (sandboxed workers + gate, `--network none`, bounded hangs,
-> bare-origin volume, conflict boundary mapped) is likewise complete and historical.
+> **STATUS: Phase 2 IMPLEMENTED (2026-06).** Phase 0 (`v0.1.0-phase0`) and Phase 1
+> (`v0.2.0-phase1`) are sealed and historical — do **NOT** re-build them; the Phase 0
+> binding spec below is historical. Phase 2 (central shared `/workspace` volume across
+> all sandboxes, N-worker `run_task` loop on `decompose`, orchestrator-sequenced
+> same-file edits so git never merges, bounded red-test repair, harness-aware Astra,
+> JSON transcript) is implemented on this branch: orchestration logic unit-tested
+> (`30 passed`); docker-gated + live model runs pending a Docker+Typhoon host.
 > Findings: [docs/phase0-findings.md](docs/phase0-findings.md) +
-> [docs/phase1-findings.md](docs/phase1-findings.md). **Phase 2 spec: TBD.**
+> [docs/phase1-findings.md](docs/phase1-findings.md) +
+> [docs/phase2-findings.md](docs/phase2-findings.md).
 
 ## What Astraeus is
 A multi-agent system where an orchestrator (**Astraeus**) plans a task, splits it among worker agents (**the Astra** — the stars), and lands their work on `main` through an automated quality gate — **with no human touching git.**
