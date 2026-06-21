@@ -130,3 +130,40 @@ def test_make_astra_shared_prompt_includes_harness(monkeypatch):
                  system_prompt=w.ASTRA_SHARED_SYSTEM_PROMPT, harness="HARNESS_BLOCK")
     assert "shared filesystem" in captured["sp"].lower()  # base shared contract
     assert "HARNESS_BLOCK" in captured["sp"]              # harness appended
+
+
+def test_run_task_reflushes_transcript_during_run(monkeypatch):
+    # run.json is written live: per round + final (not just once at the end), so a TUI
+    # can tail it while the run is still going.
+    writes, rounds_seen = [], []
+    seeded = {}
+    _patch_common(monkeypatch, seeded, rounds_seen)
+    monkeypatch.setattr(o, "seed_workspace_file", lambda rel, content, **k: writes.append(rel))
+    shared = [
+        {"id": "w1", "files": ["calc.py"], "instruction": "x"},
+        {"id": "w2", "files": ["calc.py"], "instruction": "y"},
+    ]
+    monkeypatch.setattr(o, "decompose", lambda task: shared)
+
+    o.run_task("collab")
+    run_json_writes = [w for w in writes if w.endswith("run.json")]
+    assert len(run_json_writes) >= 3   # 2 rounds + final (gating flushes add more)
+
+
+def test_emit_hook_receives_events_and_is_optional(monkeypatch):
+    seeded, rounds_seen = {}, []
+    _patch_common(monkeypatch, seeded, rounds_seen)
+    monkeypatch.setattr(o, "decompose", lambda task: PLAN)
+
+    events = []
+    o.set_emit(lambda kind, id, payload=None: events.append((kind, id)))
+    try:
+        o.run_task("t")
+    finally:
+        o.set_emit(None)                 # never leak the global across tests
+    assert any(kind == "round" for kind, _ in events)   # round events emitted when set
+    assert any(kind == "done" for kind, _ in events)
+
+    events.clear()
+    o.run_task("t")                      # emit unset -> no events, no error
+    assert events == []

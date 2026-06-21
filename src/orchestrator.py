@@ -413,6 +413,27 @@ def origin_branches():
                  IMAGE, "git", "-C", "/origin", "branch"]).stdout.strip()
 
 
+# Optional in-process event sink for live observers (e.g. the TUI). Default OFF, so a
+# headless run is byte-identical; when set, record()/round/gate progress also push a
+# (kind, id, payload) event here. An observer must never break a run, so emit() swallows.
+_EMIT = None
+
+
+def set_emit(fn):
+    """Register (or clear, with None) the event sink: fn(kind, id, payload)."""
+    global _EMIT
+    _EMIT = fn
+
+
+def emit(kind, id, payload=None):
+    """Push one event to the sink if one is registered; never raises."""
+    if _EMIT is not None:
+        try:
+            _EMIT(kind, id, payload)
+        except Exception:  # noqa: BLE001 — an observer must never break a run
+            pass
+
+
 def _run_with_cap(subtasks, cap, work):
     """Run work(s, record) for each subtask in its OWN daemon thread, concurrently,
     under a shared wall-clock `cap`. A thread still alive at the cap is a stall: its
@@ -430,6 +451,7 @@ def _run_with_cap(subtasks, cap, work):
     def record(branch, event):
         with lock:
             timeline.append((time.monotonic(), branch, event))
+        emit("timeline", branch, event)
 
     def runner(s):
         b = s["branch"]
@@ -689,17 +711,21 @@ def _repair(owner, plan, log, workspace_volume=WORKSPACE_VOLUME):
         dcmd(["rm", "-f", owner["worker"]], check=False)
 
 
-def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE_VOLUME):
+def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE_VOLUME,
+                      progress=None):
     """Gate the integrated tree (already pushed as `candidate`); on a RED TEST hand it
     back to the owning worker, bounded by max_attempts. Conflicts cannot occur (one
     integrated tree), so the only failure mode is a red test — which Typhoon can
     self-repair. Returns (landed, attempts, log, gate_state) where gate_state is one
     of "landed", "retry_exhausted", "repair_no_owner", "conflict" — the explicit
-    terminal state of the loop, so the transcript records WHY it stopped.
+    terminal state of the loop, so the transcript records WHY it stopped. `progress`,
+    if given, is called (attempts, log, interim_state) after each gate run for live UIs.
     """
     r = merge_gate("candidate")
     attempts = 1
     gate_state = None
+    if progress:
+        progress(attempts, r.log, "landed" if r.ok else "gating")
     while (not r.ok) and (not r.conflicts) and attempts < max_attempts:
         owner = _owner_for_failure(r.log, subtasks)
         if owner is None:
@@ -708,13 +734,45 @@ def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE
             break
         print(f"[astraeus] gate red -> handback to {owner['id']} "
               f"(repair {attempts}/{max_attempts - 1})")
+        emit("gate", owner["id"], "handback")
         _repair(owner, plan, r.log, workspace_volume=workspace_volume)
         push_candidate(workspace_volume=workspace_volume)
         r = merge_gate("candidate")
         attempts += 1
+        if progress:
+            progress(attempts, r.log, "landed" if r.ok else "gating")
     if gate_state is None:
         gate_state = "landed" if r.ok else ("conflict" if r.conflicts else "retry_exhausted")
+    if progress:
+        progress(attempts, r.log, gate_state)
     return r.ok, attempts, r.log, gate_state
+
+
+def _build_result(task, plan, rounds, outcomes, timeline, t0, landed=False,
+                  attempts=0, gate_log="", gate_state="running", origin_log=""):
+    """Assemble the run.json result dict from current run state. Used for the final
+    transcript AND for live partial re-flushes during a run (defaults describe a run
+    still in progress: gate_state='running')."""
+    return {
+        "task": task,
+        "plan": plan,
+        "rounds": [[s["id"] for s in r] for r in rounds],
+        "outcomes": outcomes,
+        "gate_attempts": attempts,
+        "landed": landed,
+        "gate_state": gate_state,
+        "gate_log": gate_log,
+        "origin_log": origin_log,
+        "timeline": [{"t": round(t - t0, 3), "id": b, "event": e}
+                     for (t, b, e) in sorted(timeline)],
+    }
+
+
+def flush_transcript(result, workspace_volume=WORKSPACE_VOLUME):
+    """Write run.json to the shared tree WITHOUT committing — a live progress snapshot
+    a TUI can tail. The final write_transcript() commits the permanent record."""
+    seed_workspace_file(".astraeus/run.json", json.dumps(result, indent=2),
+                        workspace_volume=workspace_volume)
 
 
 def write_transcript(result, workspace_volume=WORKSPACE_VOLUME):
@@ -767,6 +825,8 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
     try:
         for rn, rnd in enumerate(rounds):
             print(f"[astraeus] round {rn + 1}/{len(rounds)}: {[s['id'] for s in rnd]}")
+            emit("round", str(rn + 1),
+                 {"round": rn + 1, "total": len(rounds), "ids": [s["id"] for s in rnd]})
             timeline, outcomes, _ = run_round(rnd, cap, workspace_volume=workspace_volume)
             timeline_all.extend(timeline)
             outcomes_all.update(outcomes)
@@ -776,6 +836,9 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
                 if outcomes.get(s["branch"]) != "READY":
                     _discard_worker_changes(s, workspace_volume=workspace_volume)
             commit_workspace(f"astraeus: round {rn + 1}", workspace_volume=workspace_volume)
+            # Live snapshot for the TUI tail (written to the tree, committed with the next round).
+            flush_transcript(_build_result(task, plan, rounds, outcomes_all, timeline_all, t0),
+                             workspace_volume=workspace_volume)
             for s in rnd:
                 dcmd(["rm", "-f", s["worker"]], check=False)
     except Exception:
@@ -785,24 +848,24 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
 
     # Gate the integrated tree (pushed as `candidate`) with bounded red-test repair.
     push_candidate(workspace_volume=workspace_volume)
+
+    def _progress(attempts, gate_log, gate_state):
+        # Live snapshot during gating so the TUI tail sees repair attempts as they happen.
+        flush_transcript(_build_result(task, plan, rounds, outcomes_all, timeline_all, t0,
+                                       landed=(gate_state == "landed"), attempts=attempts,
+                                       gate_log=gate_log, gate_state=gate_state),
+                         workspace_volume=workspace_volume)
+
     landed, attempts, gate_log, gate_state = _gate_with_repair(
-        subtasks, plan, max_attempts=max_attempts, workspace_volume=workspace_volume)
+        subtasks, plan, max_attempts=max_attempts, workspace_volume=workspace_volume,
+        progress=_progress)
 
     origin_log = origin_main_log()
-    result = {
-        "task": task,
-        "plan": plan,
-        "rounds": [[s["id"] for s in r] for r in rounds],
-        "outcomes": outcomes_all,
-        "gate_attempts": attempts,
-        "landed": landed,
-        "gate_state": gate_state,
-        "gate_log": gate_log,
-        "origin_log": origin_log,
-        "timeline": [{"t": round(t - t0, 3), "id": b, "event": e}
-                     for (t, b, e) in sorted(timeline_all)],
-    }
+    result = _build_result(task, plan, rounds, outcomes_all, timeline_all, t0,
+                           landed=landed, attempts=attempts, gate_log=gate_log,
+                           gate_state=gate_state, origin_log=origin_log)
     write_transcript(result, workspace_volume=workspace_volume)
+    emit("done", "run", {"landed": landed, "gate_state": gate_state, "attempts": attempts})
     print(f"[astraeus] run_task done: landed={landed} gate_state={gate_state} gate_attempts={attempts}")
     print("[astraeus] origin main log:\n" + origin_log)
     return result
