@@ -183,6 +183,22 @@ def _discard_worker_changes(subtask, origin_volume=ORIGIN_VOLUME, workspace_volu
                       workspace_volume=workspace_volume, check=False)
 
 
+def _syntax_check(files, workspace_volume=WORKSPACE_VOLUME):
+    """Compile a worker's owned *.py files with py_compile in a throwaway sandbox over the
+    shared tree. Returns True iff they all compile. A syntax error in ONE worker's file
+    crashes pytest COLLECTION for the whole suite at the gate — masking every sibling — so
+    run_task drops any worker that fails this BEFORE its round is committed, and only
+    importable code ever reaches the gate. Non-.py files can't raise an import-time syntax
+    error, so they're skipped (no container is spun when a worker owns none)."""
+    py = [f for f in files if f.endswith(".py")]
+    if not py:
+        return True
+    p = dcmd(["run", "--rm", "--network", "none",
+              "-v", f"{workspace_volume}:/workspace", "-w", "/workspace",
+              IMAGE, "python", "-m", "py_compile", *py], check=False)
+    return p.returncode == 0
+
+
 # --- Step 1 ------------------------------------------------------------------
 
 def step1():
@@ -687,9 +703,18 @@ def _build_harness(s, plan):
     return ASTRA_HARNESS_TEMPLATE.format(owned=", ".join(s["files"]), siblings=siblings)
 
 
-def _owner_for_failure(log, subtasks):
-    """Best-effort: the first subtask whose file is named in a red pytest log. Matches
-    whole `*.py` path tokens (not substrings) so `a.py` never matches `aa.py`."""
+def _owner_for_failure(log, subtasks, failures=None):
+    """Best-effort: the first subtask that owns a failing file. PREFERS the gate's
+    STRUCTURED `failures` (file paths parsed from the pytest summary) — a precise signal —
+    and falls back to scanning the raw `log` for whole `*.py` path tokens. Both match on
+    full token / basename (never substring), so `a.py` never maps to `aa.py`."""
+    if failures:
+        names = set(failures)
+        basenames = {f.rsplit("/", 1)[-1] for f in failures}
+        for s in subtasks:
+            for f in s["files"]:
+                if f in names or f.rsplit("/", 1)[-1] in basenames:
+                    return s
     tokens = set(re.findall(r"[\w./-]+\.py", log))
     basenames = {t.rsplit("/", 1)[-1] for t in tokens}
     for s in subtasks:
@@ -750,7 +775,7 @@ def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE
     if progress:
         progress(attempts, r.log, "landed" if r.ok else "gating")
     while (not r.ok) and (not r.conflicts) and attempts < max_attempts:
-        owner = _owner_for_failure(r.log, subtasks)
+        owner = _owner_for_failure(r.log, subtasks, failures=r.failures)
         if owner is None:
             print("[astraeus] gate red but no owning subtask found in the log; stopping retry")
             gate_state = "repair_no_owner"
@@ -856,10 +881,18 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
             timeline, outcomes, _ = run_round(rnd, cap, workspace_volume=workspace_volume)
             timeline_all.extend(timeline)
             outcomes_all.update(outcomes)
-            # Only completed work is committed: drop partial files from any worker that
-            # stalled or errored, so incomplete work is rejected (not silently landed).
+            # Only completed, COMPILING work is committed. Drop a worker's files when it
+            # (a) stalled/errored (partial work), or (b) finished READY but left a file that
+            # does NOT compile — a syntax error would crash pytest collection for the WHOLE
+            # suite at the gate, masking every sibling. Both run BEFORE the round commit, so
+            # the working-tree discard (checkout+clean) removes the bad files cleanly and
+            # only importable code is ever committed toward the candidate.
             for s in rnd:
                 if outcomes.get(s["branch"]) != "READY":
+                    _discard_worker_changes(s, workspace_volume=workspace_volume)
+                elif not _syntax_check(s["files"], workspace_volume=workspace_volume):
+                    print(f"[astraeus] syntax guardrail: {s['id']} left non-compiling file(s) -> dropping")
+                    outcomes[s["branch"]] = outcomes_all[s["branch"]] = "FAILED_ERROR"
                     _discard_worker_changes(s, workspace_volume=workspace_volume)
             commit_workspace(f"astraeus: round {rn + 1}", workspace_volume=workspace_volume)
             # Live snapshot for the TUI tail (written to the tree, committed with the next round).

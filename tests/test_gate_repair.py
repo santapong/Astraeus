@@ -105,6 +105,17 @@ def test_owner_for_failure_no_substring_false_match():
     assert o._owner_for_failure("no python files mentioned", subs) is None
 
 
+def test_owner_for_failure_prefers_structured_failures():
+    # The gate's structured `failures` is a precise signal and must win over the raw log.
+    # w1 owns a.py; w2 owns aa.py. Failures pinpoint aa.py even though the log names a.py.
+    subs = [{"id": "w1", "branch": "w1", "worker": "c1", "files": ["a.py", "test_a.py"]},
+            {"id": "w2", "branch": "w2", "worker": "c2", "files": ["aa.py", "test_aa.py"]}]
+    assert o._owner_for_failure("E   a.py noise", subs, failures=["aa.py"])["id"] == "w2"
+    assert o._owner_for_failure("", subs, failures=["tests/test_aa.py"])["id"] == "w2"  # by basename
+    # empty/absent failures -> fall back to the raw-log scan (existing behaviour)
+    assert o._owner_for_failure("E   test_a.py::t failed", subs, failures=[])["id"] == "w1"
+
+
 def test_handback_asks_for_reflection():
     # Reflexion: the worker must reflect before fixing, not blindly re-run.
     assert "reflect" in o.RED_TEST_HANDBACK_MSG.lower()

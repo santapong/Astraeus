@@ -89,3 +89,12 @@ def test_failing_branch_is_rejected_and_main_untouched(origin):
     after = _origin_main_log(origin)
     assert "merge featW1" not in after     # nothing merged
     assert after == before                 # origin main untouched
+
+
+def test_failing_branch_reports_structured_failing_files(origin):
+    # The gate parses pytest's summary into MergeResult.failures so the orchestrator can
+    # route the red handback to the OWNING worker by exact file (not a log regex).
+    _push_branch(origin, "featW1", passing=False)
+    res = merge_gate("featW1", origin)
+    assert res.ok is False
+    assert "test_a.py" in res.failures     # the failing test file is pinpointed

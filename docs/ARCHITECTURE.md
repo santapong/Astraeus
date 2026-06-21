@@ -111,11 +111,15 @@ Step by step:
 5. **`schedule(subtasks)`** — group subtasks into rounds (see *Scheduling*).
 6. **For each round** — `run_round` starts a fresh container per subtask and dispatches the
    Astra concurrently under a wall-clock cap; then the orchestrator **discards the files of
-   any non-READY worker** (so partial/stalled work is never committed) and commits the
-   round. A later round therefore reads the previous round's committed code.
+   any non-READY worker** (partial/stalled work is never committed) **and of any READY
+   worker whose files fail a `_syntax_check`** (`py_compile`) — a syntax error would crash
+   pytest collection for the whole suite at the gate — and commits the round. A later round
+   therefore reads the previous round's committed, compiling code.
 7. **`push_candidate()`** — push the integrated tree's HEAD to `origin/candidate`; `main`
    is untouched.
-8. **`_gate_with_repair()`** — gate the candidate, with bounded red-test repair.
+8. **`_gate_with_repair()`** — gate the candidate, with bounded red-test repair; a red gate
+   is routed to the owning worker by the gate's **structured `failures`** (file paths parsed
+   from the pytest summary), falling back to a raw-log scan.
 9. **`write_transcript()`** — persist the structured run record.
 
 ### Scheduling — why git never has to merge
@@ -235,6 +239,7 @@ class MergeResult:
     ok: bool                 # green + merged
     log: str = ""            # pytest output, merge/push error, or timeout message
     conflicts: list = []     # unmerged files (only the legacy branch-merge path)
+    failures: list = []      # failing test FILE paths parsed from a red pytest summary
 ```
 
 **Run transcript** `/workspace/.astraeus/run.json` (built in `run_task`):
@@ -314,10 +319,13 @@ eliminating the merge step (and the conflict class) entirely. `run_parallel` and
   empirical risk and is unverified until live runs on a Docker + Typhoon host.
 - **No per-contribution isolation at the gate** (by design). The integrated tree is gated
   as one `candidate`, so the gate runs the *union* of all tests — but one broken file fails
-  the whole suite until repaired.
-- **Owner mapping for repair is heuristic** — `_owner_for_failure` matches whole `*.py`
-  tokens in the pytest log; with flat filenames this is precise, but an unusual layout could
-  still misattribute (the gate re-verifies, so the worst case is an honest FAILED).
+  the whole suite until repaired. A pre-gate `_syntax_check` (`py_compile`) drops a READY
+  worker whose file won't even *compile*, so a collection-crashing syntax error can't mask
+  every sibling at the gate; a *logic* error still surfaces as a normal red test.
+- **Owner mapping for repair is heuristic** — `_owner_for_failure` prefers the gate's
+  structured `failures` (exact file paths from the pytest summary) and falls back to whole
+  `*.py` tokens in the raw log; with flat filenames this is precise, but an unusual layout
+  could still misattribute (the gate re-verifies, so the worst case is an honest FAILED).
 - **`decompose._validate` does not forbid slashes** in filenames; the prompt asks for a flat
   layout, but a model that emits `src/a.py` would pass validation.
 - **Cosmetics:** the image tag says `phase1` (reused for Phase 2); `pytest` is unpinned in

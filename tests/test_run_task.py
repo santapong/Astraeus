@@ -26,6 +26,7 @@ def _patch_common(monkeypatch, seeded, rounds_seen):
     monkeypatch.setattr(o, "dcmd", lambda *a, **k: None)
     monkeypatch.setattr(o, "origin_main_log", lambda *a, **k: "abc merge candidate")
     monkeypatch.setattr(o, "merge_gate", lambda *a, **k: MergeResult(ok=True, log="passed"))
+    monkeypatch.setattr(o, "_syntax_check", lambda *a, **k: True)  # guardrail passes unless a test overrides
     monkeypatch.setattr(o, "seed_workspace_file",
                         lambda rel, content, **k: seeded.__setitem__(rel, content))
 
@@ -167,6 +168,42 @@ def test_emit_hook_receives_events_and_is_optional(monkeypatch):
     events.clear()
     o.run_task("t")                      # emit unset -> no events, no error
     assert events == []
+
+
+def test_syntax_check_flags_non_compiling_file(monkeypatch):
+    monkeypatch.setattr(o, "dcmd", lambda *a, **k: type("P", (), {"returncode": 1})())
+    assert o._syntax_check(["a.py"]) is False
+
+
+def test_syntax_check_passes_compiling_file(monkeypatch):
+    monkeypatch.setattr(o, "dcmd", lambda *a, **k: type("P", (), {"returncode": 0})())
+    assert o._syntax_check(["a.py", "test_a.py"]) is True
+
+
+def test_syntax_check_skips_when_no_python_files(monkeypatch):
+    calls = []
+    monkeypatch.setattr(o, "dcmd",
+                        lambda *a, **k: calls.append(a) or type("P", (), {"returncode": 0})())
+    assert o._syntax_check(["README.md", "data.txt"]) is True
+    assert calls == []   # no .py files -> no container spun
+
+
+def test_run_task_drops_non_compiling_worker(monkeypatch):
+    # Both workers finish READY, but w2 leaves a file that does not compile: the syntax
+    # guardrail must re-mark w2 FAILED_ERROR and discard its files BEFORE the gate, so a
+    # collection-crashing syntax error never masks w1 at the gate.
+    seeded, rounds_seen = {}, []
+    _patch_common(monkeypatch, seeded, rounds_seen)
+    monkeypatch.setattr(o, "decompose", lambda task: PLAN)
+    monkeypatch.setattr(o, "_syntax_check", lambda files, **k: "b.py" not in files)
+    discarded = []
+    monkeypatch.setattr(o, "_discard_worker_changes",
+                        lambda s, **k: discarded.append(s["branch"]))
+
+    result = o.run_task("t")
+    assert discarded == ["w2"]                          # only the non-compiling worker dropped
+    assert result["outcomes"]["w2"] == "FAILED_ERROR"   # guardrail re-marked it
+    assert result["outcomes"]["w1"] == "READY"
 
 
 def test_run_task_records_repairs_in_transcript(monkeypatch):
