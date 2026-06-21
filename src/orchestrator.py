@@ -11,13 +11,29 @@ Run (needs TYPHOON_BASE_URL + TYPHOON_API_KEY from .env, and a running docker da
     uv run --extra dev python -m src.orchestrator
 """
 
+import json
+import re
 import threading
 import time
 
-from src.docker_backend import IMAGE, ORIGIN_VOLUME, dcmd
+from src.decompose import decompose
+from src.docker_backend import (
+    IMAGE,
+    ORIGIN_VOLUME,
+    WORKSPACE_VOLUME,
+    DockerError,
+    _docker,
+    dcmd,
+)
 from src.env import load_dotenv_exports
 from src.merge_gate import merge_gate
-from src.worker import SleepyModel, make_astra, run_astra
+from src.worker import (
+    ASTRA_HARNESS_TEMPLATE,
+    ASTRA_SHARED_SYSTEM_PROMPT,
+    SleepyModel,
+    make_astra,
+    run_astra,
+)
 
 WORKER_CONTAINER = "astraeus_w1"
 
@@ -33,7 +49,7 @@ def reset_origin_volume():
     seed = (
         "git init -q --bare /origin && rm -rf /tmp/seed && git clone -q /origin /tmp/seed && "
         "cd /tmp/seed && printf 'astraeus work repo\\n' > README && "
-        "printf '__pycache__/\\n*.pyc\\n' > .gitignore && "
+        "printf '__pycache__/\\n*.pyc\\n.pytest_cache/\\n' > .gitignore && "
         "git add -A && git commit -q -m init && git push -q origin HEAD:main"
     )
     dcmd(["run", "--rm", "--network", "none", "-v", f"{ORIGIN_VOLUME}:/origin", IMAGE, "sh", "-c", seed])
@@ -69,6 +85,102 @@ def volume_inspect_oneliner():
     """Amendment 2: prove the origin volume survived the run."""
     return dcmd(["volume", "inspect", ORIGIN_VOLUME,
                  "--format", "{{.Name}} created={{.CreatedAt}} mountpoint={{.Mountpoint}}"]).stdout.strip()
+
+
+# --- Phase 2: central shared workspace (one tree every sandbox mounts) --------
+
+def _docker_available():
+    """True if the docker daemon answers — an explicit precondition (phase1 GAP #5)."""
+    try:
+        return _docker(["info"], timeout=15).returncode == 0
+    except Exception:  # noqa: BLE001 — any failure means "not available"
+        return False
+
+
+def reset_workspace_volume(origin_volume=ORIGIN_VOLUME, workspace_volume=WORKSPACE_VOLUME):
+    """Recreate the shared workspace volume fresh as a checkout of origin's main.
+
+    Unlike the bare origin (history, reachable only through git), this is a live
+    working tree mounted at /workspace in every Astra — the central filesystem all
+    sandboxes read/write directly.
+    """
+    dcmd(["volume", "rm", "-f", workspace_volume], check=False)
+    dcmd(["volume", "create", workspace_volume])
+    dcmd(["run", "--rm", "--network", "none",
+          "-v", f"{origin_volume}:/origin", "-v", f"{workspace_volume}:/workspace",
+          IMAGE, "git", "clone", "/origin", "/workspace"])
+
+
+def seed_workspace_file(rel_path, content, workspace_volume=WORKSPACE_VOLUME):
+    """Write `content` (str or bytes) to /workspace/<rel_path> in the shared tree.
+
+    Bytes go in over stdin (same mechanism as DockerSandbox.upload_files) so file
+    content is never subject to host-shell quoting; parent dirs are created.
+    """
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    p = _docker(
+        ["run", "--rm", "-i", "--network", "none",
+         "-v", f"{workspace_volume}:/workspace", "-w", "/workspace", IMAGE,
+         "sh", "-c", 'mkdir -p "$(dirname "$1")" && cat > "$1"', "_", rel_path],
+        input_bytes=content, timeout=120,
+    )
+    if p.returncode != 0:
+        raise DockerError(f"seed_workspace_file({rel_path!r}) failed:\n"
+                          + (p.stderr or b"").decode("utf-8", "replace"))
+
+
+def workspace_show(path, workspace_volume=WORKSPACE_VOLUME):
+    """Read /workspace/<path> from the shared tree via a throwaway container."""
+    return dcmd(["run", "--rm", "--network", "none", "-v", f"{workspace_volume}:/workspace",
+                 IMAGE, "cat", f"/workspace/{path}"], check=False).stdout
+
+
+def workspace_git(args, origin_volume=ORIGIN_VOLUME, workspace_volume=WORKSPACE_VOLUME, check=True):
+    """Run a git command in the shared tree (both volumes mounted so push/fetch to
+    the bare origin work). Orchestrator-owned — Astra never run git in the tree.
+    """
+    return dcmd(["run", "--rm", "--network", "none",
+                 "-v", f"{origin_volume}:/origin", "-v", f"{workspace_volume}:/workspace",
+                 "-w", "/workspace", IMAGE, "git", *args], check=check)
+
+
+def commit_workspace(msg, origin_volume=ORIGIN_VOLUME, workspace_volume=WORKSPACE_VOLUME):
+    """Stage everything and commit the shared tree (tolerates 'nothing to commit')."""
+    workspace_git(["add", "-A"], origin_volume=origin_volume,
+                  workspace_volume=workspace_volume, check=False)
+    workspace_git(["commit", "-m", msg], origin_volume=origin_volume,
+                  workspace_volume=workspace_volume, check=False)
+
+
+def push_candidate(origin_volume=ORIGIN_VOLUME, workspace_volume=WORKSPACE_VOLUME):
+    """Publish the shared tree's HEAD to origin as the `candidate` branch for the
+    gate. main is untouched; the gate tests `candidate` and merges only on green.
+    """
+    workspace_git(["push", "origin", "HEAD:candidate"], origin_volume=origin_volume,
+                  workspace_volume=workspace_volume)
+
+
+def start_shared_worker(name, workspace_volume=WORKSPACE_VOLUME):
+    """Run a fresh worker container (no network) attached to the SHARED tree. No
+    clone, no branch — the worker reads/writes the one /workspace all sandboxes see.
+    """
+    dcmd(["rm", "-f", name], check=False)
+    dcmd(["run", "-d", "--name", name, "--network", "none",
+          "-v", f"{workspace_volume}:/workspace", "-w", "/workspace", IMAGE, "sleep", "infinity"])
+
+
+def _discard_worker_changes(subtask, origin_volume=ORIGIN_VOLUME, workspace_volume=WORKSPACE_VOLUME):
+    """Drop the working-tree changes a non-READY (stalled/errored) worker left for its
+    OWN files, so partial/garbage work is never committed into the candidate. Within a
+    round files are disjoint (schedule() guarantees it), so this never touches a READY
+    sibling's work. Restores tracked files and removes untracked ones it created.
+    """
+    for f in subtask["files"]:
+        workspace_git(["checkout", "--", f], origin_volume=origin_volume,
+                      workspace_volume=workspace_volume, check=False)
+        workspace_git(["clean", "-f", "--", f], origin_volume=origin_volume,
+                      workspace_volume=workspace_volume, check=False)
 
 
 # --- Step 1 ------------------------------------------------------------------
@@ -301,43 +413,36 @@ def origin_branches():
                  IMAGE, "git", "-C", "/origin", "branch"]).stdout.strip()
 
 
-def run_parallel(subtasks, cap):
-    """Run each subtask's Astra in its OWN daemon thread, concurrently, under a
-    shared wall-clock `cap`. A thread still alive at the cap is a stall: its branch
-    is FAILED and its container is rm -f'd (the lever — a Python thread can't be
-    force-killed; killing the container unblocks any in-flight docker exec, and
+def _run_with_cap(subtasks, cap, work):
+    """Run work(s, record) for each subtask in its OWN daemon thread, concurrently,
+    under a shared wall-clock `cap`. A thread still alive at the cap is a stall: its
+    subtask is FAILED and its container is rm -f'd (the lever — a Python thread can't
+    be force-killed; killing the container unblocks any in-flight docker exec, and
     daemon=True lets the process exit even while the thread is still blocked).
 
-    Returns (timeline, outcomes) where outcomes[branch] is "READY"/"FAILED_TIMEOUT"/
-    "FAILED_ERROR".
+    `work(s, record)` does the per-subtask semantic work and returns truthy on
+    success; each subtask carries "branch" (its identifier) and "worker" (container).
+    Returns (timeline, outcomes, start) where outcomes[branch] is "READY"/
+    "FAILED_TIMEOUT"/"FAILED_ERROR".
     """
-    for s in subtasks:
-        start_worker(s["worker"], s["branch"])
-
     timeline, lock, done, threads = [], threading.Lock(), {}, {}
 
     def record(branch, event):
         with lock:
             timeline.append((time.monotonic(), branch, event))
 
-    def work(s):
+    def runner(s):
         b = s["branch"]
         record(b, "thread start")
         try:
-            astra = make_astra(s["worker"], s.get("model"))
-            record(b, "astra dispatch begin")
-            run_astra(astra, s["instruction"])
-            record(b, "astra dispatch end (committed)")
-            push_branch(s["worker"], b)
-            record(b, "pushed branch")
-            done[b] = True
+            done[b] = bool(work(s, record))
         except Exception as e:  # noqa: BLE001 — a worker failure must not crash the run
             record(b, f"ERROR {type(e).__name__}: {e}")
             done[b] = False
 
     start = time.monotonic()
     for s in subtasks:
-        t = threading.Thread(target=work, args=(s,), daemon=True)  # Amendment 5: daemon
+        t = threading.Thread(target=runner, args=(s,), daemon=True)  # Amendment 5: daemon
         threads[s["branch"]] = t
         t.start()
 
@@ -355,6 +460,69 @@ def run_parallel(subtasks, cap):
         else:
             outcomes[b] = "READY" if done.get(b) else "FAILED_ERROR"
     return timeline, outcomes, start
+
+
+def run_parallel(subtasks, cap):
+    """Phase 1 path: each subtask in its OWN isolated clone + branch, run concurrently
+    under the cap, then its branch pushed. Unchanged behaviour — used by step3/
+    step3_stall. Returns (timeline, outcomes, start)."""
+    for s in subtasks:
+        start_worker(s["worker"], s["branch"])
+
+    def work(s, record):
+        b = s["branch"]
+        astra = make_astra(s["worker"], s.get("model"))
+        record(b, "astra dispatch begin")
+        run_astra(astra, s["instruction"])
+        record(b, "astra dispatch end (committed)")
+        push_branch(s["worker"], b)
+        record(b, "pushed branch")
+        return True
+
+    return _run_with_cap(subtasks, cap, work)
+
+
+def run_round(subtasks, cap, workspace_volume=WORKSPACE_VOLUME):
+    """Phase 2 path: dispatch a round of subtasks concurrently on the SHARED tree.
+
+    Every subtask in a round is file-disjoint (schedule() guarantees it), so their
+    writes never collide. Workers do NOT commit — the orchestrator commits the tree
+    after the round. Same wall-clock cap + container-kill stall lever as run_parallel.
+    """
+    for s in subtasks:
+        start_shared_worker(s["worker"], workspace_volume=workspace_volume)
+
+    def work(s, record):
+        b = s["branch"]
+        astra = make_astra(s["worker"], s.get("model"),
+                           system_prompt=ASTRA_SHARED_SYSTEM_PROMPT, harness=s.get("harness", ""))
+        record(b, "astra dispatch begin")
+        run_astra(astra, s["instruction"])
+        record(b, "astra dispatch end")
+        return True
+
+    return _run_with_cap(subtasks, cap, work)
+
+
+def schedule(subtasks):
+    """Group subtasks into ROUNDS so same-file work is sequenced, disjoint work runs
+    in parallel. Two subtasks sharing any file land in different rounds; the
+    orchestrator runs rounds in order, committing between them, so a later writer
+    reads the earlier one's committed code — git never has to merge. Greedy first-fit,
+    deterministic in input order. All-disjoint subtasks => a single round.
+    """
+    rounds, round_files = [], []
+    for s in subtasks:
+        files = {f.lower() for f in s["files"]}
+        for i, used in enumerate(round_files):
+            if used.isdisjoint(files):
+                rounds[i].append(s)
+                round_files[i] = used | files
+                break
+        else:
+            rounds.append([s])
+            round_files.append(files)
+    return rounds
 
 
 def _print_timeline(timeline, start, label):
@@ -473,11 +641,213 @@ def step3_stall(cap=75, sleep_seconds=600):
     return ok
 
 
+# --- Phase 2: the real end-to-end loop (decompose -> collaborate -> gate) -----
+
+DEFAULT_TASK = ("Write a function add(a, b) that returns a + b with a pytest test, "
+                "and a function mul(a, b) that returns a * b with a pytest test.")
+
+# Red-test handback (NOT a conflict handback — conflicts cannot occur in the one
+# integrated tree). The owning worker reads its own pytest failure and fixes its file.
+RED_TEST_HANDBACK_MSG = (
+    "The test suite is failing and your file(s) {files} are involved. Here is the "
+    "pytest output:\n\n{log}\n\n"
+    "Fix your file(s) so the tests pass. Edit ONLY {files}. Do NOT run git. When the "
+    "logic is correct, stop — the orchestrator will re-run the tests."
+)
+
+
+def _build_harness(s, plan):
+    """Per-worker shared-tree context: what it owns + who its siblings are."""
+    others = [p for p in plan if p["id"] != s["id"]]
+    siblings = "; ".join(f"{p['id']} -> {p['files']}" for p in others) or "(none)"
+    return ASTRA_HARNESS_TEMPLATE.format(owned=", ".join(s["files"]), siblings=siblings)
+
+
+def _owner_for_failure(log, subtasks):
+    """Best-effort: the first subtask whose file is named in a red pytest log. Matches
+    whole `*.py` path tokens (not substrings) so `a.py` never matches `aa.py`."""
+    tokens = set(re.findall(r"[\w./-]+\.py", log))
+    basenames = {t.rsplit("/", 1)[-1] for t in tokens}
+    for s in subtasks:
+        for f in s["files"]:
+            if f in tokens or f.rsplit("/", 1)[-1] in basenames:
+                return s
+    return None
+
+
+def _repair(owner, plan, log, workspace_volume=WORKSPACE_VOLUME):
+    """Spin a fresh shared worker for the owning subtask, hand back its pytest failure
+    so it fixes its own file in the shared tree, then the orchestrator commits."""
+    start_shared_worker(owner["worker"], workspace_volume=workspace_volume)
+    try:
+        harness = _build_harness(owner, plan)
+        msg = RED_TEST_HANDBACK_MSG.format(files=", ".join(owner["files"]), log=log[-4000:])
+        astra = make_astra(owner["worker"], system_prompt=ASTRA_SHARED_SYSTEM_PROMPT, harness=harness)
+        run_astra(astra, msg)
+    finally:
+        commit_workspace(f"astraeus: repair {owner['id']}", workspace_volume=workspace_volume)
+        dcmd(["rm", "-f", owner["worker"]], check=False)
+
+
+def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE_VOLUME):
+    """Gate the integrated tree (already pushed as `candidate`); on a RED TEST hand it
+    back to the owning worker, bounded by max_attempts. Conflicts cannot occur (one
+    integrated tree), so the only failure mode is a red test — which Typhoon can
+    self-repair. Returns (landed, attempts, log).
+    """
+    r = merge_gate("candidate")
+    attempts = 1
+    while (not r.ok) and (not r.conflicts) and attempts < max_attempts:
+        owner = _owner_for_failure(r.log, subtasks)
+        if owner is None:
+            print("[astraeus] gate red but no owning subtask found in the log; stopping retry")
+            break
+        print(f"[astraeus] gate red -> handback to {owner['id']} "
+              f"(repair {attempts}/{max_attempts - 1})")
+        _repair(owner, plan, r.log, workspace_volume=workspace_volume)
+        push_candidate(workspace_volume=workspace_volume)
+        r = merge_gate("candidate")
+        attempts += 1
+    return r.ok, attempts, r.log
+
+
+def write_transcript(result, workspace_volume=WORKSPACE_VOLUME):
+    """Persist the structured run record to /workspace/.astraeus/run.json (kept on the
+    volume for post-run inspection — the Phase 2 proof artifact)."""
+    seed_workspace_file(".astraeus/run.json", json.dumps(result, indent=2),
+                        workspace_volume=workspace_volume)
+    commit_workspace("astraeus: run transcript", workspace_volume=workspace_volume)
+
+
+def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
+             workspace_volume=WORKSPACE_VOLUME):
+    """Phase 2 end-to-end loop: decompose -> schedule -> collaborate in ONE shared
+    tree -> gate the integrated result -> land on main -> transcript. Returns a
+    structured result dict. Pass `plan` to skip decompose (used by the shared-FS demo).
+    No human runs git; no API key enters a container; every sandbox is --network none.
+    """
+    if not _docker_available():
+        raise DockerError("docker daemon not available — run_task needs a live daemon")
+
+    reset_origin_volume()
+    reset_workspace_volume(workspace_volume=workspace_volume)
+    print(f"[astraeus] seeded bare origin {ORIGIN_VOLUME!r} + shared workspace {workspace_volume!r}")
+
+    plan = plan or decompose(task)
+    print(f"[astraeus] plan: {len(plan)} subtask(s): "
+          + ", ".join(f"{p['id']}({','.join(p['files'])})" for p in plan))
+
+    # Map plan -> runnable subtasks (one container each; "branch" = the identifier).
+    subtasks = []
+    for i, p in enumerate(plan):
+        subtasks.append({
+            "id": p["id"], "branch": p["id"], "worker": f"astraeus_w{i + 1}",
+            "files": p["files"], "instruction": p["instruction"],
+        })
+    for s in subtasks:
+        s["harness"] = _build_harness(s, plan)
+
+    # Seed the shared context every worker can read, then schedule into rounds.
+    seed_workspace_file(".astraeus/task.md", task, workspace_volume=workspace_volume)
+    seed_workspace_file(".astraeus/plan.json", json.dumps(plan, indent=2),
+                        workspace_volume=workspace_volume)
+    commit_workspace("astraeus: seed task + plan", workspace_volume=workspace_volume)
+
+    rounds = schedule(subtasks)
+    print("[astraeus] schedule: " + " | ".join(
+        "+".join(s["id"] for s in r) for r in rounds))
+
+    timeline_all, outcomes_all, t0 = [], {}, time.monotonic()
+    try:
+        for rn, rnd in enumerate(rounds):
+            print(f"[astraeus] round {rn + 1}/{len(rounds)}: {[s['id'] for s in rnd]}")
+            timeline, outcomes, _ = run_round(rnd, cap, workspace_volume=workspace_volume)
+            timeline_all.extend(timeline)
+            outcomes_all.update(outcomes)
+            # Only completed work is committed: drop partial files from any worker that
+            # stalled or errored, so incomplete work is rejected (not silently landed).
+            for s in rnd:
+                if outcomes.get(s["branch"]) != "READY":
+                    _discard_worker_changes(s, workspace_volume=workspace_volume)
+            commit_workspace(f"astraeus: round {rn + 1}", workspace_volume=workspace_volume)
+            for s in rnd:
+                dcmd(["rm", "-f", s["worker"]], check=False)
+    except Exception:
+        for s in subtasks:
+            dcmd(["rm", "-f", s["worker"]], check=False)
+        raise
+
+    # Gate the integrated tree (pushed as `candidate`) with bounded red-test repair.
+    push_candidate(workspace_volume=workspace_volume)
+    landed, attempts, gate_log = _gate_with_repair(
+        subtasks, plan, max_attempts=max_attempts, workspace_volume=workspace_volume)
+
+    origin_log = origin_main_log()
+    result = {
+        "task": task,
+        "plan": plan,
+        "rounds": [[s["id"] for s in r] for r in rounds],
+        "outcomes": outcomes_all,
+        "gate_attempts": attempts,
+        "landed": landed,
+        "gate_log": gate_log,
+        "origin_log": origin_log,
+        "timeline": [{"t": round(t - t0, 3), "id": b, "event": e}
+                     for (t, b, e) in sorted(timeline_all)],
+    }
+    write_transcript(result, workspace_volume=workspace_volume)
+    print(f"[astraeus] run_task done: landed={landed} gate_attempts={attempts}")
+    print("[astraeus] origin main log:\n" + origin_log)
+    return result
+
+
+def step_shared_demo(cap=ASTRA_CAP_SECONDS):
+    """Capstone: two workers COLLABORATE on one shared file via the central FS. featA
+    creates greet.py + its test; featB (sequenced after) ADDS to the SAME files. Proof:
+    both functions land on main with no conflict markers — no git merge ever happened.
+    """
+    plan = [
+        {"id": "featA", "files": ["greet.py", "test_greet.py"],
+         "instruction": (
+             "Create /workspace/greet.py with a function hello() that returns the "
+             "string 'hello'. Write a pytest test in /workspace/test_greet.py that does "
+             "`from greet import hello` and asserts hello() == 'hello'. Make "
+             "`python -m pytest -q test_greet.py` pass.")},
+        {"id": "featB", "files": ["greet.py", "test_greet.py"],
+         "instruction": (
+             "/workspace/greet.py already contains hello(). ADD a function bye() that "
+             "returns the string 'bye' to the SAME file WITHOUT removing hello(). Also "
+             "ADD to /workspace/test_greet.py a test that does `from greet import bye` "
+             "and asserts bye() == 'bye', keeping the existing test. Make "
+             "`python -m pytest -q test_greet.py` pass.")},
+    ]
+    print("[astraeus] SHARED-FS DEMO: featA and featB collaborate on greet.py (sequenced)")
+    result = run_task("Collaborative greet.py: hello() and bye() in one shared file",
+                      plan=plan, cap=cap)
+
+    greet = origin_show("greet.py")
+    has_hello, has_bye = "def hello(" in greet, "def bye(" in greet
+    markers = any(m in greet for m in ("<<<<<<<", "=======", ">>>>>>>"))
+    print("\n[astraeus] final origin main:greet.py:\n" + greet)
+    print(f"[astraeus] both functions present? hello={has_hello} bye={has_bye} ; "
+          f"conflict markers present? {markers}")
+    ok = bool(result["landed"] and has_hello and has_bye and not markers)
+    print("\n[astraeus] SHARED-FS DEMO " + (
+        "PASS (two sandboxes collaborated on one file; no merge needed)" if ok else "FAIL"))
+    return ok
+
+
 if __name__ == "__main__":
     import sys
 
     load_dotenv_exports()  # TYPHOON_* from .env into os.environ, before any model build
     if "--stall" in sys.argv:
         step3_stall()
+    elif "--shared-demo" in sys.argv:
+        step_shared_demo()
+    elif "--run" in sys.argv:
+        i = sys.argv.index("--run")
+        task = sys.argv[i + 1] if i + 1 < len(sys.argv) else DEFAULT_TASK
+        run_task(task)
     else:
         step3()

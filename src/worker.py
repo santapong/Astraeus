@@ -56,17 +56,56 @@ Rules:
 - Work ONLY inside /workspace, using absolute /workspace/... paths.
 """
 
+# Phase 2: the SHARED-tree variant. /workspace is a single tree that OTHER Astra
+# also use, so the agent must NOT run git at all (concurrent commits would corrupt
+# the shared index — the orchestrator is the sole committer) and must scope its
+# self-check to its OWN test file (the tree contains everyone's tests, some of
+# which may be half-written while a sibling is still working).
+ASTRA_SHARED_SYSTEM_PROMPT = """You are an Astra, a worker agent in the Astraeus system.
 
-def make_astra(container, model=None):
+You work inside a SHARED filesystem at /workspace that other Astra also read and
+write at the same time. Do EXACTLY what the instruction asks and nothing more:
+
+1. Create or edit ONLY the file(s) the instruction assigns to you, using absolute
+   paths under /workspace (for example /workspace/a.py).
+2. Write a pytest test that imports and exercises the function(s) you wrote.
+3. You may run `python -m pytest -q <your own test file>` to check YOUR work
+   (test only your own file — the shared tree holds other workers' tests too).
+
+Rules:
+- Run NO git command at all (no add, commit, clone, branch, checkout, push, merge).
+  The orchestrator commits for you. This is critical: the tree is shared.
+- Write ONLY your assigned file(s). You may READ any file under /workspace to build
+  on other workers' code, but never modify a file that is not assigned to you.
+"""
+
+# Appended to ASTRA_SHARED_SYSTEM_PROMPT per worker; tells it about the wider run.
+ASTRA_HARNESS_TEMPLATE = """
+--- shared-workspace context ---
+The overall task is in /workspace/.astraeus/task.md and the full plan (every
+worker's subtask) is in /workspace/.astraeus/plan.json — read them if useful.
+The file(s) ASSIGNED to you (write only these): {owned}.
+Other workers: {siblings}.
+If an assigned file already contains another worker's code, READ it first and ADD
+your changes without removing theirs (never delete a sibling's work).
+"""
+
+
+def make_astra(container, model=None, system_prompt=ASTRA_SYSTEM_PROMPT, harness=""):
     """Build an Astra whose filesystem + shell run inside `container` (a running
     docker container). `model` defaults to a fresh Typhoon client (built at call
     time, so it reads the env AFTER .env is loaded).
+
+    `system_prompt` selects the worker contract (default = the Phase 1 isolated-clone
+    prompt; pass ASTRA_SHARED_SYSTEM_PROMPT for the Phase 2 shared tree). `harness`
+    is an optional per-run context block appended to the prompt (empty = identical
+    to Phase 1 behaviour).
     """
     model = model or _build_typhoon_model()
     backend = DockerSandbox(container)
     return create_deep_agent(
         model=model,
-        system_prompt=ASTRA_SYSTEM_PROMPT,
+        system_prompt=system_prompt + harness,
         backend=backend,
     )
 

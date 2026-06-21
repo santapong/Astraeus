@@ -30,6 +30,13 @@ DEFAULT_TIMEOUT = 120  # seconds, per docker-exec command
 IMAGE = "astraeus-worker:phase1"
 ORIGIN_VOLUME = "astraeus_origin"
 
+# Phase 2: the central shared working tree every sandbox mounts at /workspace.
+# Unlike the bare ORIGIN_VOLUME (history, reachable only through git), this is a
+# live checkout all Astra read/write directly — "the central file system all
+# sandboxes interact with". MAX_WORKERS caps N for the N-worker loop.
+WORKSPACE_VOLUME = "astraeus_workspace"
+MAX_WORKERS = 4
+
 
 class DockerError(RuntimeError):
     """A docker CLI command exited non-zero (surfaced, never swallowed)."""
