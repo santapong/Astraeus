@@ -2,8 +2,8 @@
 
 merge_gate / _repair / push_candidate are stubbed so we test only the loop logic:
 green lands with no repair; one red triggers exactly one handback; persistent red
-fails after the cap; and a CONFLICT is never handed back (Phase 1 FINAL finding —
-the model cannot resolve merges).
+fails after the cap; a CONFLICT is never handed back (Phase 1 FINAL finding — the
+model cannot resolve merges); and every exit records an explicit `gate_state`.
 """
 
 import src.orchestrator as o
@@ -25,10 +25,11 @@ def test_green_first_try_no_repair(monkeypatch):
     _count_repairs(monkeypatch, counter)
     monkeypatch.setattr(o, "merge_gate", lambda *a, **k: MergeResult(ok=True, log="passed"))
 
-    landed, attempts, _ = o._gate_with_repair(_subtasks(), [], max_attempts=2)
+    landed, attempts, _, gate_state = o._gate_with_repair(_subtasks(), [], max_attempts=2)
     assert landed is True
     assert attempts == 1
     assert counter["n"] == 0
+    assert gate_state == "landed"
 
 
 def test_red_then_green_one_repair(monkeypatch):
@@ -38,10 +39,11 @@ def test_red_then_green_one_repair(monkeypatch):
            MergeResult(ok=True, log="ok")]
     monkeypatch.setattr(o, "merge_gate", lambda *a, **k: seq.pop(0))
 
-    landed, attempts, _ = o._gate_with_repair(_subtasks(), [], max_attempts=2)
+    landed, attempts, _, gate_state = o._gate_with_repair(_subtasks(), [], max_attempts=2)
     assert landed is True
     assert attempts == 2
     assert counter["n"] == 1
+    assert gate_state == "landed"
 
 
 def test_red_twice_fails_after_cap(monkeypatch):
@@ -53,10 +55,11 @@ def test_red_twice_fails_after_cap(monkeypatch):
         return MergeResult(ok=False, log="E   test_a.py failed")
 
     monkeypatch.setattr(o, "merge_gate", gate)
-    landed, attempts, _ = o._gate_with_repair(_subtasks(), [], max_attempts=2)
+    landed, attempts, _, gate_state = o._gate_with_repair(_subtasks(), [], max_attempts=2)
     assert landed is False
     assert gates["n"] == 2     # initial + one re-gate
     assert counter["n"] == 1   # bounded: exactly one repair
+    assert gate_state == "retry_exhausted"
 
 
 def test_conflict_never_triggers_handback(monkeypatch):
@@ -65,10 +68,25 @@ def test_conflict_never_triggers_handback(monkeypatch):
     monkeypatch.setattr(o, "merge_gate",
                         lambda *a, **k: MergeResult(ok=False, log="conflict", conflicts=["a.py"]))
 
-    landed, attempts, _ = o._gate_with_repair(_subtasks(), [], max_attempts=3)
+    landed, attempts, _, gate_state = o._gate_with_repair(_subtasks(), [], max_attempts=3)
     assert landed is False
     assert attempts == 1
     assert counter["n"] == 0   # conflicts are NEVER handed back to the model
+    assert gate_state == "conflict"
+
+
+def test_repair_no_owner_stops_with_state(monkeypatch):
+    # Red, but the log names no file owned by any subtask -> no owner -> stop, no repair.
+    counter = {"n": 0}
+    _count_repairs(monkeypatch, counter)
+    monkeypatch.setattr(o, "merge_gate",
+                        lambda *a, **k: MergeResult(ok=False, log="E   zzz.py::t failed"))
+
+    landed, attempts, _, gate_state = o._gate_with_repair(_subtasks(), [], max_attempts=3)
+    assert landed is False
+    assert attempts == 1
+    assert counter["n"] == 0
+    assert gate_state == "repair_no_owner"
 
 
 def test_owner_for_failure_maps_by_filename():

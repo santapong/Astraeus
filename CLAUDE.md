@@ -6,7 +6,7 @@
 > all sandboxes, N-worker `run_task` loop on `decompose`, orchestrator-sequenced
 > same-file edits so git never merges, bounded red-test repair, harness-aware Astra,
 > JSON transcript) is implemented on this branch: orchestration logic unit-tested
-> (`30 passed`); docker-gated + live model runs pending a Docker+Typhoon host.
+> (`34 passed`); docker-gated + live model runs pending a Docker+Typhoon host.
 > Findings: [docs/phase0-findings.md](docs/phase0-findings.md) +
 > [docs/phase1-findings.md](docs/phase1-findings.md) +
 > [docs/phase2-findings.md](docs/phase2-findings.md).

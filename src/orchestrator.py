@@ -693,14 +693,18 @@ def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE
     """Gate the integrated tree (already pushed as `candidate`); on a RED TEST hand it
     back to the owning worker, bounded by max_attempts. Conflicts cannot occur (one
     integrated tree), so the only failure mode is a red test — which Typhoon can
-    self-repair. Returns (landed, attempts, log).
+    self-repair. Returns (landed, attempts, log, gate_state) where gate_state is one
+    of "landed", "retry_exhausted", "repair_no_owner", "conflict" — the explicit
+    terminal state of the loop, so the transcript records WHY it stopped.
     """
     r = merge_gate("candidate")
     attempts = 1
+    gate_state = None
     while (not r.ok) and (not r.conflicts) and attempts < max_attempts:
         owner = _owner_for_failure(r.log, subtasks)
         if owner is None:
             print("[astraeus] gate red but no owning subtask found in the log; stopping retry")
+            gate_state = "repair_no_owner"
             break
         print(f"[astraeus] gate red -> handback to {owner['id']} "
               f"(repair {attempts}/{max_attempts - 1})")
@@ -708,7 +712,9 @@ def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE
         push_candidate(workspace_volume=workspace_volume)
         r = merge_gate("candidate")
         attempts += 1
-    return r.ok, attempts, r.log
+    if gate_state is None:
+        gate_state = "landed" if r.ok else ("conflict" if r.conflicts else "retry_exhausted")
+    return r.ok, attempts, r.log, gate_state
 
 
 def write_transcript(result, workspace_volume=WORKSPACE_VOLUME):
@@ -779,7 +785,7 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
 
     # Gate the integrated tree (pushed as `candidate`) with bounded red-test repair.
     push_candidate(workspace_volume=workspace_volume)
-    landed, attempts, gate_log = _gate_with_repair(
+    landed, attempts, gate_log, gate_state = _gate_with_repair(
         subtasks, plan, max_attempts=max_attempts, workspace_volume=workspace_volume)
 
     origin_log = origin_main_log()
@@ -790,13 +796,14 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
         "outcomes": outcomes_all,
         "gate_attempts": attempts,
         "landed": landed,
+        "gate_state": gate_state,
         "gate_log": gate_log,
         "origin_log": origin_log,
         "timeline": [{"t": round(t - t0, 3), "id": b, "event": e}
                      for (t, b, e) in sorted(timeline_all)],
     }
     write_transcript(result, workspace_volume=workspace_volume)
-    print(f"[astraeus] run_task done: landed={landed} gate_attempts={attempts}")
+    print(f"[astraeus] run_task done: landed={landed} gate_state={gate_state} gate_attempts={attempts}")
     print("[astraeus] origin main log:\n" + origin_log)
     return result
 

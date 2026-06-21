@@ -74,7 +74,7 @@ tests skip cleanly without a daemon).
 - **Phase 2 — central collaborative workspace** (current): one shared `/workspace` across
   all sandboxes, an N-worker `run_task` loop on `decompose`, orchestrator-sequenced
   same-file edits (so git never merges), bounded red-test repair, harness-aware Astra, and
-  a JSON transcript. Orchestration logic is unit-tested (`33 passed`); the docker-gated
+  a JSON transcript. Orchestration logic is unit-tested (`34 passed`); the docker-gated
   plumbing tests and the live model-driven runs (`--run`, `--shared-demo`) need a Docker +
   Typhoon host. [docs/phase2-findings.md](docs/phase2-findings.md).
 

@@ -46,6 +46,7 @@ def test_run_task_decomposes_and_wires(monkeypatch):
     result = o.run_task("my task")
     assert dcalls == ["my task"]                 # decompose called with the task
     assert result["landed"] is True
+    assert result["gate_state"] == "landed"      # explicit terminal state recorded
     assert result["plan"] == PLAN
     assert set(result["outcomes"]) == {"w1", "w2"}
     assert result["rounds"] == [["w1", "w2"]]    # disjoint -> one round
@@ -54,6 +55,7 @@ def test_run_task_decomposes_and_wires(monkeypatch):
     tr = json.loads(seeded[".astraeus/run.json"])
     assert tr["task"] == "my task"
     assert tr["landed"] is True
+    assert tr["gate_state"] == "landed"
     assert any(e["id"] in ("w1", "w2") for e in tr["timeline"])
 
 

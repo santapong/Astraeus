@@ -108,7 +108,7 @@ uv run --extra dev pytest -q
 
 ## Verified vs. pending
 
-The orchestration logic is unit-tested (`33 passed`). The docker-gated plumbing tests and
+The orchestration logic is unit-tested (`34 passed`). The docker-gated plumbing tests and
 the live model-driven runs (`--run`, `--shared-demo`) require a host with **both** a Docker
 daemon and Typhoon credentials; see [phase2-findings.md](phase2-findings.md) for the exact
 verification status.

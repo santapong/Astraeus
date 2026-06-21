@@ -243,6 +243,7 @@ class MergeResult:
 { "task": str, "plan": [...], "rounds": [["w1","w2"], ["w3"]],
   "outcomes": {"w1": "READY", "w3": "FAILED_TIMEOUT"},
   "gate_attempts": int, "landed": bool,
+  "gate_state": str,   # landed | retry_exhausted | repair_no_owner | conflict
   "gate_log": str, "origin_log": str,
   "timeline": [{"t": 0.12, "id": "w1", "event": "astra dispatch begin"}, ...] }
 ```
@@ -320,6 +321,6 @@ eliminating the merge step (and the conflict class) entirely. `run_parallel` and
   layout, but a model that emits `src/a.py` would pass validation.
 - **Cosmetics:** the image tag says `phase1` (reused for Phase 2); `pytest` is unpinned in
   the Dockerfile; `pyproject.toml` version is `0.0.0`.
-- **Verification status:** orchestration logic is unit-tested (`33 passed`); docker-gated
+- **Verification status:** orchestration logic is unit-tested (`34 passed`); docker-gated
   tests and live `--run` / `--shared-demo` runs are pending a Docker + Typhoon host. See
   [phase2-findings.md](phase2-findings.md).
