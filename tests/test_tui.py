@@ -84,3 +84,31 @@ def test_app_constructs_when_textual_present():
     pytest.importorskip("textual")
     app = tui.build_app(RESULT)   # construct (not run) — verifies the wiring imports
     assert app is not None
+
+
+def test_file_source_reads_and_handles_missing(tmp_path):
+    p = tmp_path / "run.json"
+    p.write_text(json.dumps(RESULT))
+    assert tui.file_source(str(p))()["task"] == "add + mul"
+    assert tui.file_source(str(tmp_path / "nope.json"))() is None   # missing -> None, no raise
+
+
+def test_live_refresh_updates_panels_on_poll(tmp_path):
+    pytest.importorskip("textual")
+    import asyncio
+
+    p = tmp_path / "run.json"
+    p.write_text(json.dumps(dict(RESULT, gate_state="gating", landed=False)))
+    src = tui.file_source(str(p))
+
+    async def go():
+        app = tui.build_app(src(), source=src, interval=1000)  # poll manually below
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert "gating" in str(app.query_one("#gate").render())     # initial state
+            p.write_text(json.dumps(dict(RESULT, gate_state="landed", landed=True)))
+            app._poll()                                                 # run progressed
+            await pilot.pause()
+            assert "landed" in str(app.query_one("#gate").render())     # panel refreshed
+
+    asyncio.run(go())

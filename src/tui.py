@@ -1,18 +1,22 @@
-"""Astraeus dashboard — a read-only terminal view of a finished run (Milestone B / TUI-1).
+"""Astraeus dashboard — a terminal view of a run (Milestones B static + D live).
 
-Renders a completed `/workspace/.astraeus/run.json` transcript as panels: plan, rounds,
-per-worker status, the gate verdict, the timeline, and the origin `main` log. This is a
-*viewer* only — it is never imported by `orchestrator.py`/`worker.py`, so a missing
+Renders a `/workspace/.astraeus/run.json` transcript as panels: plan, rounds, per-worker
+status, the gate verdict, the timeline, and the origin `main` log. With a *source* it
+re-reads the transcript on an interval and refreshes the panels live while a run is in
+progress (the orchestrator re-flushes run.json each round/gate-attempt — Milestone C).
+
+This is a *viewer* only — never imported by `orchestrator.py`/`worker.py`, so a missing
 `textual` dep can never break a run. Install with `uv sync --extra tui`.
 
 Design: the transcript -> view-model functions are plain and live at module top (no
-`textual` import), so they're unit-testable without the dependency. The Textual App is
-built lazily in `build_app()` / `main()`, so `import src.tui` works even when textual is
-absent (only constructing/running the App needs it).
+`textual` import, so they're unit-testable without the dep). The Textual App is built
+lazily in `build_app()` / `main()`, so `import src.tui` works even when textual is absent.
 
 Usage:
-    uv run --extra tui python -m src.tui [path/to/run.json]
-With no path it opens the bundled sample at docs/examples/sample_run.json.
+    uv run --extra tui python -m src.tui [PATH]            # static view of a saved run.json
+    uv run --extra tui python -m src.tui --watch [PATH]    # live: re-read the file on an interval
+    uv run --extra tui python -m src.tui --volume          # live: tail run.json in the docker volume
+With no PATH it opens the bundled sample at docs/examples/sample_run.json.
 """
 
 import json
@@ -94,10 +98,39 @@ def status_style(status):
     return "yellow"
 
 
+# --- live sources: callables returning a fresh transcript dict (or None) ------
+
+def file_source(path):
+    """A source that re-reads a run.json file; returns None if it's missing/unreadable."""
+    def read():
+        try:
+            return load_transcript(path)
+        except (OSError, ValueError):
+            return None
+    return read
+
+
+def volume_source(workspace_volume=None):
+    """A source that reads run.json from the docker workspace volume (live runs). Needs a
+    Docker daemon; returns None on any failure. Imports the orchestrator lazily so this
+    module stays import-safe without docker."""
+    def read():
+        try:
+            from src import orchestrator as o
+            raw = o.workspace_show(".astraeus/run.json",
+                                   workspace_volume=workspace_volume or o.WORKSPACE_VOLUME)
+            return json.loads(raw) if raw and raw.strip() else None
+        except Exception:  # noqa: BLE001 — a viewer must tolerate a not-yet-ready run
+            return None
+    return read
+
+
 # --- Textual app (lazy import; only needed to construct/run the viewer) -------
 
-def build_app(result):
-    """Construct (do not run) the Textual viewer over `result`. Imports textual lazily."""
+def build_app(result, source=None, interval=1.0):
+    """Construct (do not run) the Textual viewer over `result`. If `source` is given (a
+    callable returning a fresh transcript dict, or None), the app re-reads it every
+    `interval` seconds and refreshes the panels live. Imports textual lazily."""
     from rich.text import Text
     from textual.app import App, ComposeResult
     from textual.containers import Horizontal
@@ -109,43 +142,70 @@ def build_app(result):
         #workers { border: round $accent; margin: 0 1; height: auto; }
         #timeline { border: round $accent; margin: 0 1; height: 1fr; }
         """
-        BINDINGS = [("q", "quit", "Quit")]
+        BINDINGS = [("q", "quit", "Quit"), ("r", "refresh", "Refresh")]
 
-        def __init__(self, result):
+        def __init__(self, result, source=None, interval=1.0):
             super().__init__()
             self._r = result
+            self._source = source
+            self._interval = interval
 
         def compose(self) -> ComposeResult:
             yield Header()
             with Horizontal():
-                yield Static("\n".join(plan_lines(self._r)) or "(no plan)",
-                             classes="panel", id="plan")
-                yield Static("\n".join(round_lines(self._r)) or "(no rounds)",
-                             classes="panel", id="rounds")
+                yield Static(classes="panel", id="plan")
+                yield Static(classes="panel", id="rounds")
             yield DataTable(id="workers")
-            yield Static("\n".join(gate_lines(self._r)), classes="panel", id="gate")
+            yield Static(classes="panel", id="gate")
             yield RichLog(id="timeline", markup=True)
-            yield Static(summary_text(self._r), classes="panel", id="summary")
+            yield Static(classes="panel", id="summary")
             yield Footer()
 
         def on_mount(self):
             self.title = "Astraeus"
-            self.sub_title = self._r.get("task", "")
+            self.query_one("#workers", DataTable).add_columns("id", "files", "status")
+            self._apply(self._r)
+            if self._source is not None:
+                self.set_interval(self._interval, self._poll)
+
+        def _poll(self):
+            new = self._source()
+            if new is not None and new != self._r:
+                self._apply(new)
+
+        def action_refresh(self):
+            self._poll()
+
+        def _apply(self, result):
+            self._r = result
+            self.sub_title = result.get("task", "")
+            self.query_one("#plan", Static).update("\n".join(plan_lines(result)) or "(no plan)")
+            self.query_one("#rounds", Static).update("\n".join(round_lines(result)) or "(no rounds)")
+            self.query_one("#gate", Static).update("\n".join(gate_lines(result)))
+            self.query_one("#summary", Static).update(summary_text(result))
             table = self.query_one("#workers", DataTable)
-            table.add_columns("id", "files", "status")
-            for (wid, files, status) in worker_rows(self._r):
+            table.clear()
+            for (wid, files, status) in worker_rows(result):
                 table.add_row(wid, files, Text(status, style=status_style(status)))
             log = self.query_one("#timeline", RichLog)
-            for line in timeline_lines(self._r):
+            log.clear()
+            for line in timeline_lines(result):
                 log.write(line)
 
-    return AstraeusViewer(result)
+    return AstraeusViewer(result, source=source, interval=interval)
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    path = argv[0] if argv else _SAMPLE
-    build_app(load_transcript(path)).run()
+    paths = [a for a in argv if not a.startswith("-")]
+    if "--volume" in argv:
+        source = volume_source()
+        result = source() or {"task": "(waiting for run.json in the workspace volume)"}
+    else:
+        path = paths[0] if paths else _SAMPLE
+        source = file_source(path) if "--watch" in argv else None
+        result = load_transcript(path)
+    build_app(result, source=source).run()
 
 
 if __name__ == "__main__":

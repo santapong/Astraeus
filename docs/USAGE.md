@@ -106,6 +106,26 @@ uv run --extra dev pytest -q
 | A run reports a branch/task **FAILED** | A worker's tests stayed red after the bounded repair, a worker stalled (capped), or a worker errored — the transcript and gate log say which. `main` stays clean. |
 | Many `astraeus_*` containers/volumes linger | Containers are torn down per run; volumes (`astraeus_origin`, `astraeus_workspace`) persist for inspection and are recreated fresh each run. Remove with `docker volume rm -f astraeus_origin astraeus_workspace`. |
 
+## Dashboard (TUI)
+
+An optional terminal dashboard renders a run's `run.json` (plan, rounds, per-worker
+status, gate verdict, timeline, origin log). It needs the `textual` extra and is never
+imported by the orchestrator, so it can't affect a run:
+
+```bash
+uv sync --extra tui
+
+# Static view of a finished run (defaults to the bundled sample run):
+uv run --extra tui python -m src.tui [path/to/run.json]
+
+# Live view that refreshes while a run is in progress:
+uv run --extra tui python -m src.tui --watch path/to/run.json   # tail a file
+uv run --extra tui python -m src.tui --volume                   # tail run.json in the workspace volume
+```
+
+Keys: `r` refresh now, `q` quit. The live view works because the orchestrator re-flushes
+`run.json` after every round and gate attempt.
+
 ## Verified vs. pending
 
 The orchestration logic is unit-tested (`34 passed`). The docker-gated plumbing tests and
