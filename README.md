@@ -1,176 +1,81 @@
 # Astraeus
 
-**Astraeus** is a multi-agent system where an orchestrator (*Astraeus*) decomposes a
-task, dispatches worker agents (*the Astra* — the stars) into isolated git worktrees,
-and an automated **merge gate** tests each branch and lands it on `main` — agents
-collaborating like a disciplined dev team, **with no human touching git**.
+**Astraeus** is a multi-agent system where an orchestrator (*Astraeus*) decomposes a task,
+dispatches worker agents (*the Astra* — the stars) that **collaborate in one shared
+filesystem**, and an automated **merge gate** tests their integrated work and lands it on
+`main` — a disciplined dev team of agents, **with no human touching git**.
 
-## What Phase 0 proved
+It runs on a **free model** — [`typhoon-v2.5-30b-a3b-instruct`](https://opentyphoon.ai)
+over its OpenAI-compatible API — inside Docker sandboxes: every worker is `--network none`,
+the API key never enters a container, and the host never executes agent-written code.
 
-The full loop runs end-to-end **on a free model** —
-[`typhoon-v2.5-30b-a3b-instruct`](https://opentyphoon.ai) over its OpenAI-compatible
-API — including **self-repair**: when the gate rejects a branch, the same worker reads
-the verbatim test failure and fixes its own code.
-
-Here is the self-repair proof, verbatim from a live run (`--step3-natural`): a worker
-was made to commit a deliberately broken `add` (`return a - b`) under a test demanding
-`add(2, 3) == 5`.
-
-```
-gate attempt 1 → REJECTED:
-    def test_add():
->       assert add(2, 3) == 5
-E       assert -1 == 5
-E        +  where -1 = add(2, 3)
-    FAILED test_a.py::test_add - assert -1 == 5
-    1 failed in 0.24s
-
-→ hand the pytest log back to the same Astra, exactly once →
-   Astra fixes a.py:  return a - b   →   return a + b   and re-commits
-
-gate attempt 2 → PASS → merged
-
-main:
-    26086ab merge featW1
-    d8031f4 Fix add function to perform addition instead of subtraction
-    29784b3 phase 1
-    c2d09d6 init
-    pytest on main green? True
-```
-
-One handback, the cap held, the branch landed. The model read its own failure and
-corrected it.
+- **How to run it:** [docs/USAGE.md](docs/USAGE.md)
+- **Full technical architecture (with diagrams):** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## How it works
 
 ```mermaid
 flowchart TD
-    T["task"] --> D["decompose<br/>1 Typhoon call → 2 file-disjoint subtasks"]
-    D --> A1["Astra · featW1<br/>own git worktree"]
-    D --> A2["Astra · featW2<br/>own git worktree"]
-    A1 --> G{"merge_gate<br/>run pytest in the worktree"}
-    A2 --> G
-    G -->|green| M["main<br/>git merge --no-ff"]
-    G -->|"red → hand pytest log back once"| R["same Astra<br/>fixes & re-commits"]
-    R --> G2{"merge_gate<br/>2nd & final run"}
-    G2 -->|green| M
-    G2 -->|"still red"| F["branch FAILED<br/>not merged, reported"]
+    T["task"] --> D["decompose · 1 Typhoon call<br/>2-4 subtasks {id, files, instruction}"]
+    D --> S["schedule into rounds<br/>disjoint files = parallel · shared file = sequenced"]
+    S --> R["Astra collaborate in ONE shared /workspace<br/>(each its own container; orchestrator commits per round)"]
+    R --> C["push integrated tree as candidate"]
+    C --> G{"merge_gate<br/>full suite in a fresh container"}
+    G -->|green| M["merge --no-ff -> main"]
+    G -->|"red test -> handback to owner (bounded)"| R
+    M --> J["write run.json transcript"]
 ```
 
-- **decompose** is a single structured model call (not an agent): one task → exactly
-  two file-disjoint subtasks as strict JSON.
-- Each **Astra** is its own agent scoped to its own git worktree, so two workers never
-  step on each other.
-- **merge_gate** runs the branch's tests and only does `git merge --no-ff` if they pass.
-- On failure the gate hands the test log back to the same Astra **once**, then re-runs;
-  still failing → the branch is reported FAILED and never reaches `main`.
+1. **decompose** — one Typhoon call splits the task into 2–4 subtasks; files may overlap.
+2. **schedule** — file-disjoint subtasks run in parallel; subtasks sharing a file are
+   *sequenced* into later rounds. Because same-file work is serialized on one shared tree
+   (each later writer reads the previous commit), **git never has to merge** — which
+   sidesteps the proven limit that the worker model cannot resolve merge conflicts.
+3. **collaborate** — each Astra works in the shared `/workspace` from its own Docker
+   container, writing only its assigned files and running no git; the orchestrator commits.
+4. **gate** — the integrated tree is pushed as one `candidate` and tested in a fresh
+   container (the union of every worker's tests). Green → merged to `main`; a red test is
+   handed back to the owning worker, bounded; a stalled worker's partial work is dropped.
+5. **transcript** — every run records `/workspace/.astraeus/run.json`.
 
-## Running it
+## Quickstart
 
-Requires Python 3.11+ and [`uv`](https://docs.astral.sh/uv/). The runtime model is
-Typhoon via its OpenAI-compatible API.
+Needs Python 3.11+, [`uv`](https://docs.astral.sh/uv/), a running **Docker daemon**, and
+Typhoon credentials. Full details in [docs/USAGE.md](docs/USAGE.md).
 
-1. Create a `.env` in the repo root (**never committed** — it is gitignored):
+```bash
+# 1. credentials (never committed — .env is gitignored)
+printf 'export TYPHOON_BASE_URL="https://api.opentyphoon.ai/v1"\nexport TYPHOON_API_KEY="<key>"\n' > .env
 
-   ```
-   export TYPHOON_BASE_URL="https://api.opentyphoon.ai/v1"
-   export TYPHOON_API_KEY="<your-key>"
-   ```
+# 2. deps + worker image
+uv sync --extra dev
+docker build -t astraeus-worker:phase1 .
 
-2. Install dependencies:
+# 3. run the end-to-end loop on any task
+uv run --extra dev python -m src.orchestrator --run "Write add(a,b) with a test, and mul(a,b) with a test."
 
-   ```
-   uv sync --extra dev
-   ```
-
-3. Run an entrypoint:
-
-   ```
-   uv run --extra dev python -m src.orchestrator                 # decompose → two Astras → land both on main
-   uv run --extra dev python -m src.orchestrator --step3-planted # reject/retry loop, deterministic (no model)
-   uv run --extra dev python -m src.orchestrator --step3-natural # reject/retry loop, live self-repair
-   ```
-
-   The work repo is a throwaway temporary git repo created at runtime; nothing is
-   written into this source tree.
-
-## Phase 1 — harden the unit
-
-Phase 1 makes the unit survive reality. Workers **and** the merge gate now run inside
-ephemeral Docker containers, so the **host never executes agent-written code** (the
-gate runs `pytest` in its own container); every container runs `--network none` and is
-torn down in `finally`; the **API key never enters a container** (model calls happen on
-the host — asserted); git worktrees are retired for a **bare origin on a named docker
-volume** (no host↔container path translation, concurrent pushes safe); the two workers
-run **in parallel**; and a hung model call **can't freeze a run** — each worker is
-bounded by a wall-clock cap. Live proof: a deliberate 600-second stall was **capped at
-75s and the other branch still landed** (total wall 92.6s), so Phase 0's 19-minute
-freeze is impossible by construction.
-
-**Documented capability boundary (stated plainly):** the free worker model
-(`typhoon-v2.5-30b-a3b`) **cannot resolve a real merge conflict** — not even add/add,
-and not even when handed an explicit worked example. We proved this across three live
-runs with three distinct failure modes, under fixed honesty rules (one handback, two
-gate runs max, no human resolution, no model swap), and a pre-registered one-shot
-trial that **failed**. When a conflict can't be resolved, the gate **refuses to merge
-and the branch is reported FAILED** — `main` stays consistent and nothing broken
-lands. A mapped boundary with the honesty rules held is a result, not a gap; see
-[docs/phase1-findings.md](docs/phase1-findings.md).
-
-## Phase 2 — a central collaborative workspace
-
-Phase 2 gives every worker **one shared filesystem** instead of an isolated silo. A new
-docker volume `astraeus_workspace` is a live git checkout mounted at `/workspace` in
-**every** Astra, so a worker can read and build on another's code — the central file
-system all sandboxes interact with. The loop becomes a real `run_task(task)`:
-
-```mermaid
-flowchart TD
-    T["task"] --> D["decompose<br/>1 Typhoon call → 2..N subtasks (files may overlap)"]
-    D --> S["schedule into rounds<br/>disjoint files → parallel · shared files → sequenced"]
-    S --> R1["round 1 · Astra write into the SHARED tree"]
-    R1 --> C1["orchestrator commits the tree"]
-    C1 --> R2["round 2 · later writer reads the committed file (no merge)"]
-    R2 --> C2["orchestrator commits + pushes one `candidate`"]
-    C2 --> G{"merge_gate<br/>full suite in a fresh container"}
-    G -->|green| M["main"]
-    G -->|"red test → hand log back to the owner (bounded)"| R2
+# or the collaboration demo (two workers edit ONE shared file, sequenced)
+uv run --extra dev python -m src.orchestrator --shared-demo
 ```
 
-The Phase 1 **conflict boundary is respected by design, not by the model**: same-file
-work is *sequenced* (each later writer does read-modify-write on the prior commit), so
-git never has to 3-way-merge — the only gate failure left is a red test, which the model
-can self-repair. The gate never mounts the shared volume, so its verdict stays a pure
-function of committed code (the integrated tree is gated as one `candidate`, which makes
-the gate run the **union** of every worker's tests). Workers run **no git** at all now;
-the orchestrator is the sole committer (a shared `.git` cannot take concurrent commits).
+Other entrypoints: `python -m src.orchestrator` (default: Phase 1 parallel demo `step3`)
+and `--stall` (the bounded-hang demo). Tests: `uv run --extra dev pytest -q` (docker-gated
+tests skip cleanly without a daemon).
 
-New entrypoints:
+## Project evolution
 
-```
-uv run --extra dev python -m src.orchestrator --run "Write add(a,b) + test, and mul(a,b) + test."
-uv run --extra dev python -m src.orchestrator --shared-demo   # two workers collaborate on ONE file
-```
+- **Phase 0 — walking skeleton** (tag `v0.1.0-phase0`): decompose → two Astra in git
+  worktrees → merge gate → reject/retry-once → land on `main`, on a free model, no human
+  git, including live self-repair from a test log. [docs/phase0-findings.md](docs/phase0-findings.md).
+- **Phase 1 — hardened unit** (tag `v0.2.0-phase1`): sandboxed workers + gate,
+  `--network none`, key never in containers, bare origin volume, parallel workers, hangs
+  bounded by construction, and a **documented conflict boundary** — the worker model
+  cannot resolve a git merge conflict. [docs/phase1-findings.md](docs/phase1-findings.md).
+- **Phase 2 — central collaborative workspace** (current): one shared `/workspace` across
+  all sandboxes, an N-worker `run_task` loop on `decompose`, orchestrator-sequenced
+  same-file edits (so git never merges), bounded red-test repair, harness-aware Astra, and
+  a JSON transcript. Orchestration logic is unit-tested (`33 passed`); the docker-gated
+  plumbing tests and the live model-driven runs (`--run`, `--shared-demo`) need a Docker +
+  Typhoon host. [docs/phase2-findings.md](docs/phase2-findings.md).
 
-Each run persists `/workspace/.astraeus/run.json` (plan, rounds, outcomes, gate
-attempts, timeline) on the workspace volume for inspection.
-
-## Status
-
-**Phase 0 — walking skeleton — complete** (tag `v0.1.0-phase0`): decompose → two Astras
-in worktrees → merge gate → reject/retry-once → land on `main`, on a free model, no
-human git. Findings: [docs/phase0-findings.md](docs/phase0-findings.md).
-
-**Phase 1 — hardened unit — complete** (tag `v0.2.0-phase1`): sandboxed workers + gate,
-`--network none`, key never in containers, bare origin volume, parallel workers, hangs
-bounded by construction, conflict-resolution boundary mapped. Findings:
-[docs/phase1-findings.md](docs/phase1-findings.md).
-
-**Phase 2 — central collaborative workspace — implemented.** Shared `/workspace` volume
-across all sandboxes, N-worker `run_task` loop on `decompose`, orchestrator-sequenced
-same-file edits (no merges), bounded red-test repair, harness-aware Astra, JSON
-transcript. The orchestration logic is unit-tested (`30 passed`); the docker-gated
-plumbing tests and the live model-driven runs (`--run`, `--shared-demo`) require a host
-with Docker + Typhoon and are pending. Design & status:
-[docs/phase2-findings.md](docs/phase2-findings.md). Treat this as a local development
-tool, not a hardened multi-tenant service.
+Treat this as a local development tool, not a hardened multi-tenant service.

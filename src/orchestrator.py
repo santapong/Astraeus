@@ -12,6 +12,7 @@ Run (needs TYPHOON_BASE_URL + TYPHOON_API_KEY from .env, and a running docker da
 """
 
 import json
+import re
 import threading
 import time
 
@@ -167,6 +168,19 @@ def start_shared_worker(name, workspace_volume=WORKSPACE_VOLUME):
     dcmd(["rm", "-f", name], check=False)
     dcmd(["run", "-d", "--name", name, "--network", "none",
           "-v", f"{workspace_volume}:/workspace", "-w", "/workspace", IMAGE, "sleep", "infinity"])
+
+
+def _discard_worker_changes(subtask, origin_volume=ORIGIN_VOLUME, workspace_volume=WORKSPACE_VOLUME):
+    """Drop the working-tree changes a non-READY (stalled/errored) worker left for its
+    OWN files, so partial/garbage work is never committed into the candidate. Within a
+    round files are disjoint (schedule() guarantees it), so this never touches a READY
+    sibling's work. Restores tracked files and removes untracked ones it created.
+    """
+    for f in subtask["files"]:
+        workspace_git(["checkout", "--", f], origin_volume=origin_volume,
+                      workspace_volume=workspace_volume, check=False)
+        workspace_git(["clean", "-f", "--", f], origin_volume=origin_volume,
+                      workspace_volume=workspace_volume, check=False)
 
 
 # --- Step 1 ------------------------------------------------------------------
@@ -650,10 +664,13 @@ def _build_harness(s, plan):
 
 
 def _owner_for_failure(log, subtasks):
-    """Best-effort: the first subtask whose file name appears in a red pytest log."""
+    """Best-effort: the first subtask whose file is named in a red pytest log. Matches
+    whole `*.py` path tokens (not substrings) so `a.py` never matches `aa.py`."""
+    tokens = set(re.findall(r"[\w./-]+\.py", log))
+    basenames = {t.rsplit("/", 1)[-1] for t in tokens}
     for s in subtasks:
         for f in s["files"]:
-            if f in log:
+            if f in tokens or f.rsplit("/", 1)[-1] in basenames:
                 return s
     return None
 
@@ -747,6 +764,11 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
             timeline, outcomes, _ = run_round(rnd, cap, workspace_volume=workspace_volume)
             timeline_all.extend(timeline)
             outcomes_all.update(outcomes)
+            # Only completed work is committed: drop partial files from any worker that
+            # stalled or errored, so incomplete work is rejected (not silently landed).
+            for s in rnd:
+                if outcomes.get(s["branch"]) != "READY":
+                    _discard_worker_changes(s, workspace_volume=workspace_volume)
             commit_workspace(f"astraeus: round {rn + 1}", workspace_volume=workspace_volume)
             for s in rnd:
                 dcmd(["rm", "-f", s["worker"]], check=False)

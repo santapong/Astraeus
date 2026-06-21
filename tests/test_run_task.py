@@ -90,6 +90,27 @@ def test_run_task_plan_override_skips_decompose(monkeypatch):
     assert dcalls == []                          # decompose NOT called when plan supplied
 
 
+def test_run_task_discards_failed_worker_changes(monkeypatch):
+    seeded, rounds_seen = {}, []
+    _patch_common(monkeypatch, seeded, rounds_seen)
+    monkeypatch.setattr(o, "decompose", lambda task: PLAN)
+
+    # one worker READY, the other FAILED_ERROR (partial/garbage work to drop).
+    def run_round(subtasks, cap, **k):
+        tl = [(0.0, s["branch"], "astra dispatch begin") for s in subtasks]
+        oc = {s["branch"]: ("READY" if i == 0 else "FAILED_ERROR")
+              for i, s in enumerate(subtasks)}
+        return tl, oc, 0.0
+    monkeypatch.setattr(o, "run_round", run_round)
+
+    discarded = []
+    monkeypatch.setattr(o, "_discard_worker_changes",
+                        lambda s, **k: discarded.append(s["branch"]))
+
+    o.run_task("t")
+    assert discarded == ["w2"]  # only the non-READY worker's changes are dropped
+
+
 def test_build_harness_lists_owned_and_siblings():
     h = o._build_harness({"id": "w1", "files": ["a.py", "test_a.py"]}, PLAN)
     assert "a.py, test_a.py" in h   # what it owns

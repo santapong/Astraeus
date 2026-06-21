@@ -8,11 +8,13 @@ merge conflict) it leaves origin's main untouched and hands the log back.
 All docker/git ops are list-form via dcmd() and check their exit codes.
 """
 
+import subprocess
 from dataclasses import dataclass, field
 
 from src.docker_backend import IMAGE, ORIGIN_VOLUME, dcmd
 
 GATE_CONTAINER = "astraeus_gate"
+GATE_TEST_TIMEOUT = 300  # seconds; a suite that exceeds this is a clean red, not a crash
 
 
 @dataclass
@@ -41,8 +43,13 @@ def merge_gate(branch, origin_volume=ORIGIN_VOLUME, image=IMAGE):
         dcmd(["exec", "-w", "/workspace", GATE_CONTAINER, "git", "checkout", branch])
 
         # Run the branch's tests INSIDE the gate container. Host never runs this code.
-        tests = dcmd(["exec", "-w", "/workspace", GATE_CONTAINER,
-                      "python", "-m", "pytest", "-q"], check=False)
+        # A suite that overruns the cap is a clean red verdict, not an uncaught crash
+        # (the finally below removes the container, killing the runaway pytest).
+        try:
+            tests = dcmd(["exec", "-w", "/workspace", GATE_CONTAINER,
+                          "python", "-m", "pytest", "-q"], check=False, timeout=GATE_TEST_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return MergeResult(ok=False, log=f"gate pytest timed out after {GATE_TEST_TIMEOUT}s")
         if tests.returncode != 0:
             return MergeResult(ok=False, log=_combined(tests))  # red → main untouched
 

@@ -75,3 +75,13 @@ def test_owner_for_failure_maps_by_filename():
     subs = _subtasks()
     assert o._owner_for_failure("E test_b.py::test_mul failed", subs)["id"] == "w2"
     assert o._owner_for_failure("nothing matches", subs) is None
+
+
+def test_owner_for_failure_no_substring_false_match():
+    # w1 owns a.py; w2 owns aa.py. A log mentioning ONLY aa.py must map to w2 — the
+    # old substring check ("a.py" in "aa.py") would have wrongly picked w1.
+    subs = [{"id": "w1", "branch": "w1", "worker": "c1", "files": ["a.py", "test_a.py"]},
+            {"id": "w2", "branch": "w2", "worker": "c2", "files": ["aa.py", "test_aa.py"]}]
+    assert o._owner_for_failure("E   test_aa.py::t failed in aa.py", subs)["id"] == "w2"
+    assert o._owner_for_failure("E   test_a.py::t failed", subs)["id"] == "w1"
+    assert o._owner_for_failure("no python files mentioned", subs) is None
