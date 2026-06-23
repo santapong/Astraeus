@@ -115,11 +115,13 @@ Step by step:
    worker whose files fail a `_syntax_check`** (`py_compile`) — a syntax error would crash
    pytest collection for the whole suite at the gate — and commits the round. A later round
    therefore reads the previous round's committed, compiling code.
-7. **`push_candidate()`** — push the integrated tree's HEAD to `origin/candidate`; `main`
-   is untouched.
+7. **`push_candidate()`** — push the integrated tree's HEAD to a **per-run unique ref**
+   `origin/candidate-<run_id>` (so overlapping runs never collide on the ref); `main` is untouched.
 8. **`_gate_with_repair()`** — gate the candidate, with bounded red-test repair; a red gate
    is routed to the owning worker by the gate's **structured `failures`** (file paths parsed
-   from the pytest summary), falling back to a raw-log scan.
+   from the pytest summary), falling back to a raw-log scan. The repair worker runs under the
+   **same wall-clock cap** as a round worker (`_run_with_cap`), so a hung repair can't freeze
+   the loop.
 9. **`write_transcript()`** — persist the structured run record.
 
 ### Scheduling — why git never has to merge
@@ -278,8 +280,9 @@ Hardcoded, opinionated — no config layer. Change them at the source.
 | `WORKSPACE_VOLUME` | `docker_backend.py` | Shared working tree volume (`astraeus_workspace`). |
 | `MAX_WORKERS` | `docker_backend.py` | Cap on subtasks per task (`4`). |
 | `WORKDIR` / `DEFAULT_TIMEOUT` | `docker_backend.py` | Container cwd (`/workspace`) / per-`docker exec` timeout (120s). |
-| `ASTRA_CAP_SECONDS` | `orchestrator.py` | Per-Astra wall-clock cap (`300`). |
+| `ASTRA_CAP_SECONDS` | `orchestrator.py` | Per-Astra wall-clock cap (`300`) — bounds round workers AND each gate repair. |
 | `GATE_TEST_TIMEOUT` | `merge_gate.py` | Cap on the gate's pytest run (`300`); overrun → clean red. |
+| `ASTRAEUS_RUNTIME` (env) | `docker_backend.py` | Opt-in container runtime for agent/gate sandboxes (e.g. `runsc` for gVisor); unset → Docker default. |
 
 ## Phase 1 legacy path (historical)
 
@@ -316,7 +319,9 @@ eliminating the merge step (and the conflict class) entirely. `run_parallel` and
   your files", and "read-modify-write a shared file without deleting a sibling's work" are
   instructions the worker must follow. The gate's full suite is the backstop: a violation
   surfaces as a red test → bounded repair, or an honest FAILED. This is the central
-  empirical risk and is unverified until live runs on a Docker + Typhoon host.
+  empirical risk and is unverified until live runs on a Docker + Typhoon host. Defence-in-depth:
+  `ASTRAEUS_RUNTIME=runsc` runs the agent + gate containers under gVisor, hardening the host
+  against a container escape that would otherwise reach the mounted `/origin` + `/workspace`.
 - **No per-contribution isolation at the gate** (by design). The integrated tree is gated
   as one `candidate`, so the gate runs the *union* of all tests — but one broken file fails
   the whole suite until repaired. A pre-gate `_syntax_check` (`py_compile`) drops a READY
@@ -327,9 +332,11 @@ eliminating the merge step (and the conflict class) entirely. `run_parallel` and
   `*.py` tokens in the raw log; with flat filenames this is precise, but an unusual layout
   could still misattribute (the gate re-verifies, so the worst case is an honest FAILED).
 - **`decompose._validate` does not forbid slashes** in filenames; the prompt asks for a flat
-  layout, but a model that emits `src/a.py` would pass validation.
+  layout, but a model that emits `src/a.py` would pass validation. Invalid/non-conforming model
+  output is **bounded-retried** (re-prompt with the validation error fed back, default 2 attempts)
+  before raising, rather than failing on the first bad parse.
 - **Cosmetics:** the image tag says `phase1` (reused for Phase 2); `pytest` is unpinned in
   the Dockerfile; `pyproject.toml` version is `0.0.0`.
-- **Verification status:** orchestration logic is unit-tested (`34 passed`); docker-gated
+- **Verification status:** orchestration logic is unit-tested (`73 passed`); docker-gated
   tests and live `--run` / `--shared-demo` runs are pending a Docker + Typhoon host. See
   [phase2-findings.md](phase2-findings.md).

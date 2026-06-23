@@ -142,3 +142,41 @@ def test_on_repair_receives_reflection(monkeypatch):
         on_repair=lambda oid, att, refl: repairs.append((oid, att, refl)))
     assert landed is True and gate_state == "landed"
     assert repairs == [("w1", 1, "expected 5 got 4; will fix add")]   # owner, attempt, reflection
+
+
+def test_repair_runs_under_cap_and_captures_reflection(monkeypatch):
+    # A hung repair must not freeze the orchestrator: _repair runs the worker through
+    # _run_with_cap (same wall-clock cap as a round worker), forwarding the cap.
+    monkeypatch.setattr(o, "start_shared_worker", lambda *a, **k: None)
+    monkeypatch.setattr(o, "commit_workspace", lambda *a, **k: None)
+    monkeypatch.setattr(o, "dcmd", lambda *a, **k: None)
+    monkeypatch.setattr(o, "make_astra", lambda *a, **k: object())
+    monkeypatch.setattr(o, "run_astra", lambda astra, msg: {
+        "messages": [{"role": "assistant", "content": "expected 5 got 4; will fix add()"}]})
+    seen = {}
+
+    def fake_cap(subtasks, cap, work):
+        seen["cap"], seen["n"] = cap, len(subtasks)
+        work(subtasks[0], lambda *a, **k: None)   # simulate in-time completion
+        return [], {subtasks[0]["branch"]: "READY"}, 0.0
+
+    monkeypatch.setattr(o, "_run_with_cap", fake_cap)
+    owner = {"id": "w1", "branch": "w1", "worker": "c1", "files": ["a.py"]}
+    refl = o._repair(owner, [owner], "E test_a.py failed", cap=123)
+    assert seen == {"cap": 123, "n": 1}           # bounded by the forwarded cap, one worker
+    assert "fix add" in refl                      # reflection captured from the worker
+
+
+def test_repair_timeout_discards_partial_and_returns_empty(monkeypatch):
+    monkeypatch.setattr(o, "start_shared_worker", lambda *a, **k: None)
+    monkeypatch.setattr(o, "commit_workspace", lambda *a, **k: None)
+    monkeypatch.setattr(o, "dcmd", lambda *a, **k: None)
+    discarded = []
+    monkeypatch.setattr(o, "_discard_worker_changes", lambda s, **k: discarded.append(s["branch"]))
+    # _run_with_cap reports a stall and never runs work (worker killed at the cap).
+    monkeypatch.setattr(o, "_run_with_cap",
+                        lambda subtasks, cap, work: ([], {subtasks[0]["branch"]: "FAILED_TIMEOUT"}, 0.0))
+    owner = {"id": "w1", "branch": "w1", "worker": "c1", "files": ["a.py"]}
+    refl = o._repair(owner, [owner], "log", cap=1)
+    assert refl == ""                             # no reflection on timeout
+    assert discarded == ["w1"]                    # partial repair dropped, not committed

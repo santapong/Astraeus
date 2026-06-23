@@ -206,6 +206,26 @@ def test_run_task_drops_non_compiling_worker(monkeypatch):
     assert result["outcomes"]["w1"] == "READY"
 
 
+def test_run_task_uses_unique_candidate_branch(monkeypatch):
+    # The candidate ref is per-run unique (candidate-<id>) so overlapping runs don't collide,
+    # and the gate must test exactly the branch that was pushed.
+    seeded, rounds_seen = {}, []
+    _patch_common(monkeypatch, seeded, rounds_seen)
+    monkeypatch.setattr(o, "decompose", lambda task: PLAN)
+    seen = {}
+    monkeypatch.setattr(o, "push_candidate",
+                        lambda candidate="candidate", **k: seen.__setitem__("pushed", candidate))
+
+    def fake_gate(branch, *a, **k):
+        seen["gated"] = branch
+        return MergeResult(ok=True, log="ok")
+    monkeypatch.setattr(o, "merge_gate", fake_gate)
+
+    o.run_task("t")
+    assert seen["pushed"].startswith("candidate-")   # unique per-run ref, not a fixed name
+    assert seen["gated"] == seen["pushed"]           # gate tests exactly what was pushed
+
+
 def test_run_task_records_repairs_in_transcript(monkeypatch):
     seeded, rounds_seen = {}, []
     _patch_common(monkeypatch, seeded, rounds_seen)

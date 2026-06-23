@@ -14,6 +14,7 @@ calls happen in the orchestrator process on the host, so the container needs no
 API key.
 """
 
+import os
 import subprocess
 
 from deepagents.backends.protocol import (
@@ -54,6 +55,19 @@ def dcmd(args, check=True, timeout=120):
         joined = " ".join(str(a) for a in args)
         raise DockerError(f"`docker {joined}` exit {p.returncode}:\n{p.stdout}{p.stderr}")
     return p
+
+
+def _runtime_args():
+    """Opt-in container runtime for the sandboxes that execute AGENT code/tests.
+
+    `ASTRAEUS_RUNTIME=runsc` runs those containers under gVisor — a one-line `docker run`
+    flag, no image/orchestration change — to harden against container escape (the cheapest
+    mitigation for the documented Docker-escape risk; see docs/research/harness-sandbox-deep.md).
+    Empty by default, so behaviour is unchanged unless the env var is set. Trusted git
+    plumbing keeps the default runtime.
+    """
+    rt = os.environ.get("ASTRAEUS_RUNTIME", "").strip()
+    return ["--runtime", rt] if rt else []
 
 
 def _docker(args, input_bytes=None, timeout=None):

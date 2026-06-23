@@ -15,6 +15,7 @@ import json
 import re
 import threading
 import time
+import uuid
 
 from src.decompose import decompose
 from src.docker_backend import (
@@ -23,6 +24,7 @@ from src.docker_backend import (
     WORKSPACE_VOLUME,
     DockerError,
     _docker,
+    _runtime_args,
     dcmd,
 )
 from src.env import load_dotenv_exports
@@ -58,7 +60,7 @@ def reset_origin_volume():
 def start_worker(name, branch):
     """Run a fresh worker container (no network) and clone+branch it for the Astra."""
     dcmd(["rm", "-f", name], check=False)
-    dcmd(["run", "-d", "--name", name, "--network", "none",
+    dcmd(["run", *_runtime_args(), "-d", "--name", name, "--network", "none",
           "-v", f"{ORIGIN_VOLUME}:/origin", "-w", "/workspace", IMAGE, "sleep", "infinity"])
     dcmd(["exec", name, "git", "clone", "/origin", "/workspace"])
     dcmd(["exec", "-w", "/workspace", name, "git", "checkout", "-b", branch])
@@ -153,11 +155,13 @@ def commit_workspace(msg, origin_volume=ORIGIN_VOLUME, workspace_volume=WORKSPAC
                   workspace_volume=workspace_volume, check=False)
 
 
-def push_candidate(origin_volume=ORIGIN_VOLUME, workspace_volume=WORKSPACE_VOLUME):
-    """Publish the shared tree's HEAD to origin as the `candidate` branch for the
-    gate. main is untouched; the gate tests `candidate` and merges only on green.
+def push_candidate(candidate="candidate", origin_volume=ORIGIN_VOLUME, workspace_volume=WORKSPACE_VOLUME):
+    """Publish the shared tree's HEAD to origin as the candidate branch for the gate. main
+    is untouched; the gate tests this branch and merges only on green. `candidate` is a
+    per-run unique ref (run_task passes `candidate-<run_id>`) so overlapping runs never
+    collide on a shared ref.
     """
-    workspace_git(["push", "origin", "HEAD:candidate"], origin_volume=origin_volume,
+    workspace_git(["push", "origin", f"HEAD:{candidate}"], origin_volume=origin_volume,
                   workspace_volume=workspace_volume)
 
 
@@ -166,7 +170,7 @@ def start_shared_worker(name, workspace_volume=WORKSPACE_VOLUME):
     clone, no branch — the worker reads/writes the one /workspace all sandboxes see.
     """
     dcmd(["rm", "-f", name], check=False)
-    dcmd(["run", "-d", "--name", name, "--network", "none",
+    dcmd(["run", *_runtime_args(), "-d", "--name", name, "--network", "none",
           "-v", f"{workspace_volume}:/workspace", "-w", "/workspace", IMAGE, "sleep", "infinity"])
 
 
@@ -741,24 +745,38 @@ def _extract_reflection(state, limit=300):
     return ""
 
 
-def _repair(owner, plan, log, workspace_volume=WORKSPACE_VOLUME):
+def _repair(owner, plan, log, cap=ASTRA_CAP_SECONDS, workspace_volume=WORKSPACE_VOLUME):
     """Spin a fresh shared worker for the owning subtask, hand back its pytest failure so
     it reflects then fixes its own file in the shared tree; the orchestrator commits.
-    Returns the worker's reflection text (best-effort, '' if unavailable)."""
+
+    Runs under the same wall-clock `cap` + container-kill stall-lever as a round worker
+    (via _run_with_cap), so a hung repair can NOT freeze the orchestrator. A repair that
+    times out or errors has its partial changes discarded before the commit. Returns the
+    worker's reflection text (best-effort, '' if unavailable / timed out)."""
     start_shared_worker(owner["worker"], workspace_volume=workspace_volume)
-    reflection = ""
+    captured = {"reflection": ""}
+    outcomes = {}
+    harness = _build_harness(owner, plan)
+    msg = RED_TEST_HANDBACK_MSG.format(files=", ".join(owner["files"]), log=log[-4000:])
+
+    def work(s, record):
+        astra = make_astra(s["worker"], system_prompt=ASTRA_SHARED_SYSTEM_PROMPT, harness=harness)
+        captured["reflection"] = _extract_reflection(run_astra(astra, msg))
+        return True
+
     try:
-        harness = _build_harness(owner, plan)
-        msg = RED_TEST_HANDBACK_MSG.format(files=", ".join(owner["files"]), log=log[-4000:])
-        astra = make_astra(owner["worker"], system_prompt=ASTRA_SHARED_SYSTEM_PROMPT, harness=harness)
-        reflection = _extract_reflection(run_astra(astra, msg))
+        _, outcomes, _ = _run_with_cap([owner], cap, work)
     finally:
+        if outcomes.get(owner["branch"]) != "READY":
+            # timed out or errored -> drop the half-done repair so it isn't committed
+            _discard_worker_changes(owner, workspace_volume=workspace_volume)
         commit_workspace(f"astraeus: repair {owner['id']}", workspace_volume=workspace_volume)
         dcmd(["rm", "-f", owner["worker"]], check=False)
-    return reflection
+    return captured["reflection"]
 
 
-def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE_VOLUME,
+def _gate_with_repair(subtasks, plan, candidate="candidate", max_attempts=2,
+                      cap=ASTRA_CAP_SECONDS, workspace_volume=WORKSPACE_VOLUME,
                       progress=None, on_repair=None):
     """Gate the integrated tree (already pushed as `candidate`); on a RED TEST hand it
     back to the owning worker, bounded by max_attempts. Conflicts cannot occur (one
@@ -769,7 +787,7 @@ def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE
     if given, is called (attempts, log, interim_state) after each gate run; `on_repair`,
     if given, is called (owner_id, attempt, reflection) after each handback.
     """
-    r = merge_gate("candidate")
+    r = merge_gate(candidate)
     attempts = 1
     gate_state = None
     if progress:
@@ -783,11 +801,11 @@ def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE
         print(f"[astraeus] gate red -> handback to {owner['id']} "
               f"(repair {attempts}/{max_attempts - 1})")
         emit("gate", owner["id"], "handback")
-        reflection = _repair(owner, plan, r.log, workspace_volume=workspace_volume)
+        reflection = _repair(owner, plan, r.log, cap=cap, workspace_volume=workspace_volume)
         if on_repair:
             on_repair(owner["id"], attempts, reflection)
-        push_candidate(workspace_volume=workspace_volume)
-        r = merge_gate("candidate")
+        push_candidate(candidate=candidate, workspace_volume=workspace_volume)
+        r = merge_gate(candidate)
         attempts += 1
         if progress:
             progress(attempts, r.log, "landed" if r.ok else "gating")
@@ -906,8 +924,10 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
             dcmd(["rm", "-f", s["worker"]], check=False)
         raise
 
-    # Gate the integrated tree (pushed as `candidate`) with bounded red-test repair.
-    push_candidate(workspace_volume=workspace_volume)
+    # Gate the integrated tree (pushed as a per-run unique candidate ref) with bounded
+    # red-test repair. A unique ref means overlapping runs never collide on `candidate`.
+    candidate = f"candidate-{uuid.uuid4().hex[:8]}"
+    push_candidate(candidate=candidate, workspace_volume=workspace_volume)
 
     def _progress(attempts, gate_log, gate_state):
         # Live snapshot during gating so the TUI tail sees repair attempts as they happen.
@@ -922,8 +942,8 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
         repairs_all.append({"owner_id": owner_id, "attempt": attempt, "reflection": reflection})
 
     landed, attempts, gate_log, gate_state = _gate_with_repair(
-        subtasks, plan, max_attempts=max_attempts, workspace_volume=workspace_volume,
-        progress=_progress, on_repair=_on_repair)
+        subtasks, plan, candidate=candidate, max_attempts=max_attempts, cap=cap,
+        workspace_volume=workspace_volume, progress=_progress, on_repair=_on_repair)
 
     origin_log = origin_main_log()
     result = _build_result(task, plan, rounds, outcomes_all, timeline_all, t0,

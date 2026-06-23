@@ -11,7 +11,7 @@ All docker/git ops are list-form via dcmd() and check their exit codes.
 import subprocess
 from dataclasses import dataclass, field
 
-from src.docker_backend import IMAGE, ORIGIN_VOLUME, dcmd
+from src.docker_backend import IMAGE, ORIGIN_VOLUME, _runtime_args, dcmd
 
 GATE_CONTAINER = "astraeus_gate"
 GATE_TEST_TIMEOUT = 300  # seconds; a suite that exceeds this is a clean red, not a crash
@@ -56,7 +56,8 @@ def merge_gate(branch, origin_volume=ORIGIN_VOLUME, image=IMAGE):
     or the merge/push failure (on a conflict), so the orchestrator can hand it back.
     """
     dcmd(["rm", "-f", GATE_CONTAINER], check=False)
-    dcmd(["run", "-d", "--name", GATE_CONTAINER, "--network", "none",
+    # gVisor-hardened when ASTRAEUS_RUNTIME is set: the gate runs agent-written pytest.
+    dcmd(["run", *_runtime_args(), "-d", "--name", GATE_CONTAINER, "--network", "none",
           "-v", f"{origin_volume}:/origin", "-w", "/workspace", image, "sleep", "infinity"])
     try:
         # Orchestrator-owned git plumbing: clone the bare origin, check out the branch.
