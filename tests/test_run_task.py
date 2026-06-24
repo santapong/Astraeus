@@ -7,6 +7,8 @@ structured transcript. Also checks the harness block and the shared system promp
 
 import json
 
+import pytest
+
 import src.orchestrator as o
 import src.worker as w
 from src.merge_gate import MergeResult
@@ -27,6 +29,7 @@ def _patch_common(monkeypatch, seeded, rounds_seen):
     monkeypatch.setattr(o, "origin_main_log", lambda *a, **k: "abc merge candidate")
     monkeypatch.setattr(o, "merge_gate", lambda *a, **k: MergeResult(ok=True, log="passed"))
     monkeypatch.setattr(o, "_syntax_check", lambda *a, **k: True)  # guardrail passes unless a test overrides
+    monkeypatch.setattr(o, "_enforce_ownership", lambda *a, **k: [])  # ownership guard: nothing stray unless overridden
     monkeypatch.setattr(o, "seed_workspace_file",
                         lambda rel, content, **k: seeded.__setitem__(rel, content))
 
@@ -204,6 +207,61 @@ def test_run_task_drops_non_compiling_worker(monkeypatch):
     assert discarded == ["w2"]                          # only the non-compiling worker dropped
     assert result["outcomes"]["w2"] == "FAILED_ERROR"   # guardrail re-marked it
     assert result["outcomes"]["w1"] == "READY"
+
+
+def test_enforce_ownership_discards_out_of_scope(monkeypatch):
+    rnd = [{"id": "w1", "branch": "w1", "worker": "c1", "files": ["a.py", "test_a.py"]}]
+    porcelain = " M a.py\n?? c.py\n?? __pycache__/\n M .astraeus/run.json\n"
+    calls = []
+
+    def fake_git(args, **k):
+        calls.append(list(args))
+        out = porcelain if args[:2] == ["status", "--porcelain"] else ""
+        return type("P", (), {"stdout": out})()
+
+    monkeypatch.setattr(o, "workspace_git", fake_git)
+    stray = o._enforce_ownership(rnd)
+    assert stray == ["c.py", "__pycache__/"]          # a.py owned; .astraeus/ is orchestrator-owned
+    assert ["checkout", "--", "c.py"] in calls         # stray files are discarded from the tree
+    assert ["clean", "-fd", "--", "__pycache__/"] in calls
+
+
+def test_enforce_ownership_allows_owned_and_astraeus(monkeypatch):
+    rnd = [{"id": "w1", "branch": "w1", "worker": "c1", "files": ["a.py"]},
+           {"id": "w2", "branch": "w2", "worker": "c2", "files": ["b.py"]}]
+    porcelain = " M a.py\n M b.py\n M .astraeus/plan.json\n"
+    monkeypatch.setattr(o, "workspace_git",
+                        lambda args, **k: type("P", (), {
+                            "stdout": porcelain if args[:2] == ["status", "--porcelain"] else ""})())
+    assert o._enforce_ownership(rnd) == []             # nothing out of lane -> no discards
+
+
+def test_run_task_runs_ownership_guard_each_round(monkeypatch):
+    shared = [{"id": "w1", "files": ["calc.py"], "instruction": "x"},
+              {"id": "w2", "files": ["calc.py"], "instruction": "y"}]
+    seeded, rounds_seen = {}, []
+    _patch_common(monkeypatch, seeded, rounds_seen)
+    monkeypatch.setattr(o, "decompose", lambda task: shared)
+    guarded = []
+    monkeypatch.setattr(o, "_enforce_ownership",
+                        lambda rnd, **k: guarded.append([s["id"] for s in rnd]) or [])
+    o.run_task("collab")
+    assert guarded == [["w1"], ["w2"]]                 # guard runs once per (sequenced) round
+
+
+def test_run_task_persists_transcript_on_gate_crash(monkeypatch):
+    seeded, rounds_seen = {}, []
+    _patch_common(monkeypatch, seeded, rounds_seen)
+    monkeypatch.setattr(o, "decompose", lambda task: PLAN)
+
+    def boom(*a, **k):
+        raise o.DockerError("gate blew up")
+
+    monkeypatch.setattr(o, "_gate_with_repair", boom)
+    with pytest.raises(o.DockerError):
+        o.run_task("t")
+    tr = json.loads(seeded[".astraeus/run.json"])      # transcript still persisted on crash...
+    assert tr["gate_state"] == "error"                 # ...with an explicit error terminal state
 
 
 def test_run_task_uses_unique_candidate_branch(monkeypatch):

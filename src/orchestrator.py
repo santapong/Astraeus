@@ -187,6 +187,32 @@ def _discard_worker_changes(subtask, origin_volume=ORIGIN_VOLUME, workspace_volu
                       workspace_volume=workspace_volume, check=False)
 
 
+def _enforce_ownership(round_subtasks, workspace_volume=WORKSPACE_VOLUME):
+    """Code-enforce "write only your files": after a round, drop any changed/untracked path NOT
+    owned by some worker in the round (and not under the orchestrator's `.astraeus/`), so a worker
+    that wrote outside its lane can't smuggle a stray file into the candidate. Runs BEFORE the
+    round commit (like _syntax_check), reusing the working-tree discard. The gate stays the backstop
+    for *in-file* violations (clobbering a sibling's function); this closes the *new-file* hole that
+    was previously only prompt-discouraged. Returns the discarded stray paths (best-effort)."""
+    owned = set()
+    for s in round_subtasks:
+        owned.update(s["files"])
+    status = workspace_git(["status", "--porcelain"], workspace_volume=workspace_volume, check=False)
+    stray = []
+    for line in (status.stdout or "").splitlines():
+        path = line[3:]                    # porcelain: 2 status chars + space + path
+        if " -> " in path:                 # a rename reports "old -> new"; the new path is on disk
+            path = path.split(" -> ", 1)[1]
+        path = path.strip().strip('"')
+        if not path or path in owned or path.startswith(".astraeus/"):
+            continue
+        stray.append(path)
+    for path in stray:
+        workspace_git(["checkout", "--", path], workspace_volume=workspace_volume, check=False)
+        workspace_git(["clean", "-fd", "--", path], workspace_volume=workspace_volume, check=False)
+    return stray
+
+
 def _syntax_check(files, workspace_volume=WORKSPACE_VOLUME):
     """Compile a worker's owned *.py files with py_compile in a throwaway sandbox over the
     shared tree. Returns True iff they all compile. A syntax error in ONE worker's file
@@ -912,6 +938,10 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
                     print(f"[astraeus] syntax guardrail: {s['id']} left non-compiling file(s) -> dropping")
                     outcomes[s["branch"]] = outcomes_all[s["branch"]] = "FAILED_ERROR"
                     _discard_worker_changes(s, workspace_volume=workspace_volume)
+            # Code-enforce file ownership: drop any out-of-lane stray files before the commit.
+            stray = _enforce_ownership(rnd, workspace_volume=workspace_volume)
+            if stray:
+                print(f"[astraeus] ownership guard dropped out-of-scope path(s): {stray}")
             commit_workspace(f"astraeus: round {rn + 1}", workspace_volume=workspace_volume)
             # Live snapshot for the TUI tail (written to the tree, committed with the next round).
             flush_transcript(_build_result(task, plan, rounds, outcomes_all, timeline_all, t0,
@@ -927,7 +957,6 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
     # Gate the integrated tree (pushed as a per-run unique candidate ref) with bounded
     # red-test repair. A unique ref means overlapping runs never collide on `candidate`.
     candidate = f"candidate-{uuid.uuid4().hex[:8]}"
-    push_candidate(candidate=candidate, workspace_volume=workspace_volume)
 
     def _progress(attempts, gate_log, gate_state):
         # Live snapshot during gating so the TUI tail sees repair attempts as they happen.
@@ -941,15 +970,23 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
         # Reflexion: record the worker's self-reflection for each bounded repair attempt.
         repairs_all.append({"owner_id": owner_id, "attempt": attempt, "reflection": reflection})
 
-    landed, attempts, gate_log, gate_state = _gate_with_repair(
-        subtasks, plan, candidate=candidate, max_attempts=max_attempts, cap=cap,
-        workspace_volume=workspace_volume, progress=_progress, on_repair=_on_repair)
-
-    origin_log = origin_main_log()
-    result = _build_result(task, plan, rounds, outcomes_all, timeline_all, t0,
-                           landed=landed, attempts=attempts, gate_log=gate_log,
-                           gate_state=gate_state, origin_log=origin_log, repairs=repairs_all)
-    write_transcript(result, workspace_volume=workspace_volume)
+    try:
+        push_candidate(candidate=candidate, workspace_volume=workspace_volume)
+        landed, attempts, gate_log, gate_state = _gate_with_repair(
+            subtasks, plan, candidate=candidate, max_attempts=max_attempts, cap=cap,
+            workspace_volume=workspace_volume, progress=_progress, on_repair=_on_repair)
+        origin_log = origin_main_log()
+        result = _build_result(task, plan, rounds, outcomes_all, timeline_all, t0,
+                               landed=landed, attempts=attempts, gate_log=gate_log,
+                               gate_state=gate_state, origin_log=origin_log, repairs=repairs_all)
+        write_transcript(result, workspace_volume=workspace_volume)
+    except Exception as e:  # noqa: BLE001 — durability: never lose the run record on a gate/docker crash
+        result = _build_result(task, plan, rounds, outcomes_all, timeline_all, t0,
+                               landed=False, gate_state="error",
+                               gate_log=f"{type(e).__name__}: {e}", repairs=repairs_all)
+        flush_transcript(result, workspace_volume=workspace_volume)
+        emit("done", "run", {"landed": False, "gate_state": "error", "attempts": 0})
+        raise
     emit("done", "run", {"landed": landed, "gate_state": gate_state, "attempts": attempts})
     print(f"[astraeus] run_task done: landed={landed} gate_state={gate_state} gate_attempts={attempts}")
     print("[astraeus] origin main log:\n" + origin_log)

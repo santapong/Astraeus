@@ -113,8 +113,10 @@ Step by step:
    Astra concurrently under a wall-clock cap; then the orchestrator **discards the files of
    any non-READY worker** (partial/stalled work is never committed) **and of any READY
    worker whose files fail a `_syntax_check`** (`py_compile`) — a syntax error would crash
-   pytest collection for the whole suite at the gate — and commits the round. A later round
-   therefore reads the previous round's committed, compiling code.
+   pytest collection for the whole suite at the gate. `_enforce_ownership` then drops any
+   out-of-lane stray file (a path no round worker owns, outside `.astraeus/`), code-enforcing
+   "write only your files"; then it commits the round. A later round therefore reads the
+   previous round's committed, compiling, in-lane code.
 7. **`push_candidate()`** — push the integrated tree's HEAD to a **per-run unique ref**
    `origin/candidate-<run_id>` (so overlapping runs never collide on the ref); `main` is untouched.
 8. **`_gate_with_repair()`** — gate the candidate, with bounded red-test repair; a red gate
@@ -250,7 +252,7 @@ class MergeResult:
 { "task": str, "plan": [...], "rounds": [["w1","w2"], ["w3"]],
   "outcomes": {"w1": "READY", "w3": "FAILED_TIMEOUT"},
   "gate_attempts": int, "landed": bool,
-  "gate_state": str,   # landed | retry_exhausted | repair_no_owner | conflict
+  "gate_state": str,   # landed | retry_exhausted | repair_no_owner | conflict | error
   "repairs": [{"owner_id": str, "attempt": int, "reflection": str}],
   "gate_log": str, "origin_log": str,
   "timeline": [{"t": 0.12, "id": "w1", "event": "astra dispatch begin"}, ...] }
@@ -315,13 +317,14 @@ eliminating the merge step (and the conflict class) entirely. `run_parallel` and
 
 ## Known limitations / audit notes
 
-- **Model discipline is prompt-enforced, not code-enforced.** "Run no git", "write only
-  your files", and "read-modify-write a shared file without deleting a sibling's work" are
-  instructions the worker must follow. The gate's full suite is the backstop: a violation
-  surfaces as a red test → bounded repair, or an honest FAILED. This is the central
-  empirical risk and is unverified until live runs on a Docker + Typhoon host. Defence-in-depth:
-  `ASTRAEUS_RUNTIME=runsc` runs the agent + gate containers under gVisor, hardening the host
-  against a container escape that would otherwise reach the mounted `/origin` + `/workspace`.
+- **Model discipline is now partly code-enforced, partly prompt-enforced.** The *file boundary*
+  of "write only your files" is code-enforced by `_enforce_ownership` (a stray file no round worker
+  owns is dropped pre-commit); *in-file* discipline ("run no git", "don't clobber a sibling's
+  function in a shared file") remains instruction + gate backstop — a violation surfaces as a red
+  test → bounded repair, or an honest FAILED. The in-file case is the central empirical risk,
+  unverified until live runs on a Docker + Typhoon host. Defence-in-depth: `ASTRAEUS_RUNTIME=runsc`
+  runs the agent + gate containers under gVisor, hardening the host against a container escape that
+  would otherwise reach the mounted `/origin` + `/workspace`.
 - **No per-contribution isolation at the gate** (by design). The integrated tree is gated
   as one `candidate`, so the gate runs the *union* of all tests — but one broken file fails
   the whole suite until repaired. A pre-gate `_syntax_check` (`py_compile`) drops a READY
@@ -337,6 +340,6 @@ eliminating the merge step (and the conflict class) entirely. `run_parallel` and
   before raising, rather than failing on the first bad parse.
 - **Cosmetics:** the image tag says `phase1` (reused for Phase 2); `pytest` is unpinned in
   the Dockerfile; `pyproject.toml` version is `0.0.0`.
-- **Verification status:** orchestration logic is unit-tested (`73 passed`); docker-gated
+- **Verification status:** orchestration logic is unit-tested (`77 passed`); docker-gated
   tests and live `--run` / `--shared-demo` runs are pending a Docker + Typhoon host. See
   [phase2-findings.md](phase2-findings.md).
