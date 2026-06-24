@@ -6,8 +6,24 @@ _extract_json_array (tolerant JSON parsing) directly.
 
 import pytest
 
-from src.decompose import DecomposeError, _extract_json_array, _validate
+from src.decompose import DecomposeError, _extract_json_array, _validate, decompose
 from src.docker_backend import MAX_WORKERS
+
+
+class _FakeModel:
+    """Minimal stand-in for the Typhoon ChatOpenAI: .invoke(prompt).content from a queue."""
+
+    def __init__(self, outputs):
+        self._outputs = list(outputs)
+        self.prompts = []
+
+    def invoke(self, prompt):
+        self.prompts.append(prompt)
+        return type("R", (), {"content": self._outputs.pop(0)})()
+
+
+_VALID = ('[{"id":"w1","files":["a.py"],"instruction":"do a"},'
+          '{"id":"w2","files":["b.py"],"instruction":"do b"}]')
 
 
 def _subtask(i, files):
@@ -76,3 +92,25 @@ def test_extract_json_array_with_surrounding_prose_and_bracket_in_string():
 def test_extract_json_array_raises_when_absent():
     with pytest.raises(DecomposeError):
         _extract_json_array("no array anywhere here")
+
+
+def test_decompose_happy_path_is_single_call():
+    m = _FakeModel([_VALID])
+    out = decompose("t", model=m)
+    assert [s["id"] for s in out] == ["w1", "w2"]
+    assert len(m.prompts) == 1                       # valid first try -> no retry
+
+
+def test_decompose_retries_on_invalid_then_succeeds():
+    m = _FakeModel(["not json at all", _VALID])
+    out = decompose("t", model=m)
+    assert len(out) == 2
+    assert len(m.prompts) == 2                       # one retry
+    assert "REJECTED" in m.prompts[1]                # validation error fed back into the retry
+
+
+def test_decompose_raises_after_max_attempts():
+    m = _FakeModel(["nope", "still nope", "and again"])
+    with pytest.raises(DecomposeError):
+        decompose("t", model=m, max_attempts=2)
+    assert len(m.prompts) == 2                        # bounded: stops at max_attempts

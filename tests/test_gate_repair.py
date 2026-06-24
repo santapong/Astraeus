@@ -2,8 +2,8 @@
 
 merge_gate / _repair / push_candidate are stubbed so we test only the loop logic:
 green lands with no repair; one red triggers exactly one handback; persistent red
-fails after the cap; and a CONFLICT is never handed back (Phase 1 FINAL finding —
-the model cannot resolve merges).
+fails after the cap; a CONFLICT is never handed back (Phase 1 FINAL finding — the
+model cannot resolve merges); and every exit records an explicit `gate_state`.
 """
 
 import src.orchestrator as o
@@ -25,10 +25,11 @@ def test_green_first_try_no_repair(monkeypatch):
     _count_repairs(monkeypatch, counter)
     monkeypatch.setattr(o, "merge_gate", lambda *a, **k: MergeResult(ok=True, log="passed"))
 
-    landed, attempts, _ = o._gate_with_repair(_subtasks(), [], max_attempts=2)
+    landed, attempts, _, gate_state = o._gate_with_repair(_subtasks(), [], max_attempts=2)
     assert landed is True
     assert attempts == 1
     assert counter["n"] == 0
+    assert gate_state == "landed"
 
 
 def test_red_then_green_one_repair(monkeypatch):
@@ -38,10 +39,11 @@ def test_red_then_green_one_repair(monkeypatch):
            MergeResult(ok=True, log="ok")]
     monkeypatch.setattr(o, "merge_gate", lambda *a, **k: seq.pop(0))
 
-    landed, attempts, _ = o._gate_with_repair(_subtasks(), [], max_attempts=2)
+    landed, attempts, _, gate_state = o._gate_with_repair(_subtasks(), [], max_attempts=2)
     assert landed is True
     assert attempts == 2
     assert counter["n"] == 1
+    assert gate_state == "landed"
 
 
 def test_red_twice_fails_after_cap(monkeypatch):
@@ -53,10 +55,11 @@ def test_red_twice_fails_after_cap(monkeypatch):
         return MergeResult(ok=False, log="E   test_a.py failed")
 
     monkeypatch.setattr(o, "merge_gate", gate)
-    landed, attempts, _ = o._gate_with_repair(_subtasks(), [], max_attempts=2)
+    landed, attempts, _, gate_state = o._gate_with_repair(_subtasks(), [], max_attempts=2)
     assert landed is False
     assert gates["n"] == 2     # initial + one re-gate
     assert counter["n"] == 1   # bounded: exactly one repair
+    assert gate_state == "retry_exhausted"
 
 
 def test_conflict_never_triggers_handback(monkeypatch):
@@ -65,10 +68,25 @@ def test_conflict_never_triggers_handback(monkeypatch):
     monkeypatch.setattr(o, "merge_gate",
                         lambda *a, **k: MergeResult(ok=False, log="conflict", conflicts=["a.py"]))
 
-    landed, attempts, _ = o._gate_with_repair(_subtasks(), [], max_attempts=3)
+    landed, attempts, _, gate_state = o._gate_with_repair(_subtasks(), [], max_attempts=3)
     assert landed is False
     assert attempts == 1
     assert counter["n"] == 0   # conflicts are NEVER handed back to the model
+    assert gate_state == "conflict"
+
+
+def test_repair_no_owner_stops_with_state(monkeypatch):
+    # Red, but the log names no file owned by any subtask -> no owner -> stop, no repair.
+    counter = {"n": 0}
+    _count_repairs(monkeypatch, counter)
+    monkeypatch.setattr(o, "merge_gate",
+                        lambda *a, **k: MergeResult(ok=False, log="E   zzz.py::t failed"))
+
+    landed, attempts, _, gate_state = o._gate_with_repair(_subtasks(), [], max_attempts=3)
+    assert landed is False
+    assert attempts == 1
+    assert counter["n"] == 0
+    assert gate_state == "repair_no_owner"
 
 
 def test_owner_for_failure_maps_by_filename():
@@ -85,3 +103,80 @@ def test_owner_for_failure_no_substring_false_match():
     assert o._owner_for_failure("E   test_aa.py::t failed in aa.py", subs)["id"] == "w2"
     assert o._owner_for_failure("E   test_a.py::t failed", subs)["id"] == "w1"
     assert o._owner_for_failure("no python files mentioned", subs) is None
+
+
+def test_owner_for_failure_prefers_structured_failures():
+    # The gate's structured `failures` is a precise signal and must win over the raw log.
+    # w1 owns a.py; w2 owns aa.py. Failures pinpoint aa.py even though the log names a.py.
+    subs = [{"id": "w1", "branch": "w1", "worker": "c1", "files": ["a.py", "test_a.py"]},
+            {"id": "w2", "branch": "w2", "worker": "c2", "files": ["aa.py", "test_aa.py"]}]
+    assert o._owner_for_failure("E   a.py noise", subs, failures=["aa.py"])["id"] == "w2"
+    assert o._owner_for_failure("", subs, failures=["tests/test_aa.py"])["id"] == "w2"  # by basename
+    # empty/absent failures -> fall back to the raw-log scan (existing behaviour)
+    assert o._owner_for_failure("E   test_a.py::t failed", subs, failures=[])["id"] == "w1"
+
+
+def test_handback_asks_for_reflection():
+    # Reflexion: the worker must reflect before fixing, not blindly re-run.
+    assert "reflect" in o.RED_TEST_HANDBACK_MSG.lower()
+
+
+def test_extract_reflection_from_state():
+    state = {"messages": [
+        {"role": "user", "content": "fix it"},
+        {"role": "assistant", "content": "Expected 5 but got 4; I will fix add()."}]}
+    assert "Expected 5" in o._extract_reflection(state)
+    assert o._extract_reflection({}) == ""              # missing/odd state -> '' (no raise)
+    assert o._extract_reflection({"messages": []}) == ""
+
+
+def test_on_repair_receives_reflection(monkeypatch):
+    monkeypatch.setattr(o, "_repair", lambda *a, **k: "expected 5 got 4; will fix add")
+    monkeypatch.setattr(o, "push_candidate", lambda *a, **k: None)
+    seq = [MergeResult(ok=False, log="E   test_a.py::t failed"), MergeResult(ok=True, log="ok")]
+    monkeypatch.setattr(o, "merge_gate", lambda *a, **k: seq.pop(0))
+
+    repairs = []
+    landed, attempts, _, gate_state = o._gate_with_repair(
+        _subtasks(), [], max_attempts=2,
+        on_repair=lambda oid, att, refl: repairs.append((oid, att, refl)))
+    assert landed is True and gate_state == "landed"
+    assert repairs == [("w1", 1, "expected 5 got 4; will fix add")]   # owner, attempt, reflection
+
+
+def test_repair_runs_under_cap_and_captures_reflection(monkeypatch):
+    # A hung repair must not freeze the orchestrator: _repair runs the worker through
+    # _run_with_cap (same wall-clock cap as a round worker), forwarding the cap.
+    monkeypatch.setattr(o, "start_shared_worker", lambda *a, **k: None)
+    monkeypatch.setattr(o, "commit_workspace", lambda *a, **k: None)
+    monkeypatch.setattr(o, "dcmd", lambda *a, **k: None)
+    monkeypatch.setattr(o, "make_astra", lambda *a, **k: object())
+    monkeypatch.setattr(o, "run_astra", lambda astra, msg: {
+        "messages": [{"role": "assistant", "content": "expected 5 got 4; will fix add()"}]})
+    seen = {}
+
+    def fake_cap(subtasks, cap, work):
+        seen["cap"], seen["n"] = cap, len(subtasks)
+        work(subtasks[0], lambda *a, **k: None)   # simulate in-time completion
+        return [], {subtasks[0]["branch"]: "READY"}, 0.0
+
+    monkeypatch.setattr(o, "_run_with_cap", fake_cap)
+    owner = {"id": "w1", "branch": "w1", "worker": "c1", "files": ["a.py"]}
+    refl = o._repair(owner, [owner], "E test_a.py failed", cap=123)
+    assert seen == {"cap": 123, "n": 1}           # bounded by the forwarded cap, one worker
+    assert "fix add" in refl                      # reflection captured from the worker
+
+
+def test_repair_timeout_discards_partial_and_returns_empty(monkeypatch):
+    monkeypatch.setattr(o, "start_shared_worker", lambda *a, **k: None)
+    monkeypatch.setattr(o, "commit_workspace", lambda *a, **k: None)
+    monkeypatch.setattr(o, "dcmd", lambda *a, **k: None)
+    discarded = []
+    monkeypatch.setattr(o, "_discard_worker_changes", lambda s, **k: discarded.append(s["branch"]))
+    # _run_with_cap reports a stall and never runs work (worker killed at the cap).
+    monkeypatch.setattr(o, "_run_with_cap",
+                        lambda subtasks, cap, work: ([], {subtasks[0]["branch"]: "FAILED_TIMEOUT"}, 0.0))
+    owner = {"id": "w1", "branch": "w1", "worker": "c1", "files": ["a.py"]}
+    refl = o._repair(owner, [owner], "log", cap=1)
+    assert refl == ""                             # no reflection on timeout
+    assert discarded == ["w1"]                    # partial repair dropped, not committed

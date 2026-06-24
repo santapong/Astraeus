@@ -52,7 +52,7 @@ share files, bounded self-repair, and a persisted run transcript. Companion to
   (the task + plan). Every run persists `/workspace/.astraeus/run.json` (plan, rounds,
   per-worker outcomes, gate attempts, timeline) for post-run inspection.
 
-## VERIFIED (unit/logic tests, ran green: `30 passed, 6 skipped`)
+## VERIFIED (unit/logic tests, ran green: `34 passed, 6 skipped`)
 
 - **decompose contract** (`tests/test_decompose.py`): accepts 2–4 subtasks, unique ids,
   shared files allowed; rejects <2, >MAX_WORKERS, duplicate ids, missing/empty fields;

@@ -15,6 +15,7 @@ import json
 import re
 import threading
 import time
+import uuid
 
 from src.decompose import decompose
 from src.docker_backend import (
@@ -23,6 +24,7 @@ from src.docker_backend import (
     WORKSPACE_VOLUME,
     DockerError,
     _docker,
+    _runtime_args,
     dcmd,
 )
 from src.env import load_dotenv_exports
@@ -58,7 +60,7 @@ def reset_origin_volume():
 def start_worker(name, branch):
     """Run a fresh worker container (no network) and clone+branch it for the Astra."""
     dcmd(["rm", "-f", name], check=False)
-    dcmd(["run", "-d", "--name", name, "--network", "none",
+    dcmd(["run", *_runtime_args(), "-d", "--name", name, "--network", "none",
           "-v", f"{ORIGIN_VOLUME}:/origin", "-w", "/workspace", IMAGE, "sleep", "infinity"])
     dcmd(["exec", name, "git", "clone", "/origin", "/workspace"])
     dcmd(["exec", "-w", "/workspace", name, "git", "checkout", "-b", branch])
@@ -153,11 +155,13 @@ def commit_workspace(msg, origin_volume=ORIGIN_VOLUME, workspace_volume=WORKSPAC
                   workspace_volume=workspace_volume, check=False)
 
 
-def push_candidate(origin_volume=ORIGIN_VOLUME, workspace_volume=WORKSPACE_VOLUME):
-    """Publish the shared tree's HEAD to origin as the `candidate` branch for the
-    gate. main is untouched; the gate tests `candidate` and merges only on green.
+def push_candidate(candidate="candidate", origin_volume=ORIGIN_VOLUME, workspace_volume=WORKSPACE_VOLUME):
+    """Publish the shared tree's HEAD to origin as the candidate branch for the gate. main
+    is untouched; the gate tests this branch and merges only on green. `candidate` is a
+    per-run unique ref (run_task passes `candidate-<run_id>`) so overlapping runs never
+    collide on a shared ref.
     """
-    workspace_git(["push", "origin", "HEAD:candidate"], origin_volume=origin_volume,
+    workspace_git(["push", "origin", f"HEAD:{candidate}"], origin_volume=origin_volume,
                   workspace_volume=workspace_volume)
 
 
@@ -166,7 +170,7 @@ def start_shared_worker(name, workspace_volume=WORKSPACE_VOLUME):
     clone, no branch — the worker reads/writes the one /workspace all sandboxes see.
     """
     dcmd(["rm", "-f", name], check=False)
-    dcmd(["run", "-d", "--name", name, "--network", "none",
+    dcmd(["run", *_runtime_args(), "-d", "--name", name, "--network", "none",
           "-v", f"{workspace_volume}:/workspace", "-w", "/workspace", IMAGE, "sleep", "infinity"])
 
 
@@ -181,6 +185,48 @@ def _discard_worker_changes(subtask, origin_volume=ORIGIN_VOLUME, workspace_volu
                       workspace_volume=workspace_volume, check=False)
         workspace_git(["clean", "-f", "--", f], origin_volume=origin_volume,
                       workspace_volume=workspace_volume, check=False)
+
+
+def _enforce_ownership(round_subtasks, workspace_volume=WORKSPACE_VOLUME):
+    """Code-enforce "write only your files": after a round, drop any changed/untracked path NOT
+    owned by some worker in the round (and not under the orchestrator's `.astraeus/`), so a worker
+    that wrote outside its lane can't smuggle a stray file into the candidate. Runs BEFORE the
+    round commit (like _syntax_check), reusing the working-tree discard. The gate stays the backstop
+    for *in-file* violations (clobbering a sibling's function); this closes the *new-file* hole that
+    was previously only prompt-discouraged. Returns the discarded stray paths (best-effort)."""
+    owned = set()
+    for s in round_subtasks:
+        owned.update(s["files"])
+    status = workspace_git(["status", "--porcelain"], workspace_volume=workspace_volume, check=False)
+    stray = []
+    for line in (status.stdout or "").splitlines():
+        path = line[3:]                    # porcelain: 2 status chars + space + path
+        if " -> " in path:                 # a rename reports "old -> new"; the new path is on disk
+            path = path.split(" -> ", 1)[1]
+        path = path.strip().strip('"')
+        if not path or path in owned or path.startswith(".astraeus/"):
+            continue
+        stray.append(path)
+    for path in stray:
+        workspace_git(["checkout", "--", path], workspace_volume=workspace_volume, check=False)
+        workspace_git(["clean", "-fd", "--", path], workspace_volume=workspace_volume, check=False)
+    return stray
+
+
+def _syntax_check(files, workspace_volume=WORKSPACE_VOLUME):
+    """Compile a worker's owned *.py files with py_compile in a throwaway sandbox over the
+    shared tree. Returns True iff they all compile. A syntax error in ONE worker's file
+    crashes pytest COLLECTION for the whole suite at the gate — masking every sibling — so
+    run_task drops any worker that fails this BEFORE its round is committed, and only
+    importable code ever reaches the gate. Non-.py files can't raise an import-time syntax
+    error, so they're skipped (no container is spun when a worker owns none)."""
+    py = [f for f in files if f.endswith(".py")]
+    if not py:
+        return True
+    p = dcmd(["run", "--rm", "--network", "none",
+              "-v", f"{workspace_volume}:/workspace", "-w", "/workspace",
+              IMAGE, "python", "-m", "py_compile", *py], check=False)
+    return p.returncode == 0
 
 
 # --- Step 1 ------------------------------------------------------------------
@@ -413,6 +459,27 @@ def origin_branches():
                  IMAGE, "git", "-C", "/origin", "branch"]).stdout.strip()
 
 
+# Optional in-process event sink for live observers (e.g. the TUI). Default OFF, so a
+# headless run is byte-identical; when set, record()/round/gate progress also push a
+# (kind, id, payload) event here. An observer must never break a run, so emit() swallows.
+_EMIT = None
+
+
+def set_emit(fn):
+    """Register (or clear, with None) the event sink: fn(kind, id, payload)."""
+    global _EMIT
+    _EMIT = fn
+
+
+def emit(kind, id, payload=None):
+    """Push one event to the sink if one is registered; never raises."""
+    if _EMIT is not None:
+        try:
+            _EMIT(kind, id, payload)
+        except Exception:  # noqa: BLE001 — an observer must never break a run
+            pass
+
+
 def _run_with_cap(subtasks, cap, work):
     """Run work(s, record) for each subtask in its OWN daemon thread, concurrently,
     under a shared wall-clock `cap`. A thread still alive at the cap is a stall: its
@@ -430,6 +497,7 @@ def _run_with_cap(subtasks, cap, work):
     def record(branch, event):
         with lock:
             timeline.append((time.monotonic(), branch, event))
+        emit("timeline", branch, event)
 
     def runner(s):
         b = s["branch"]
@@ -651,8 +719,10 @@ DEFAULT_TASK = ("Write a function add(a, b) that returns a + b with a pytest tes
 RED_TEST_HANDBACK_MSG = (
     "The test suite is failing and your file(s) {files} are involved. Here is the "
     "pytest output:\n\n{log}\n\n"
-    "Fix your file(s) so the tests pass. Edit ONLY {files}. Do NOT run git. When the "
-    "logic is correct, stop — the orchestrator will re-run the tests."
+    "FIRST, in one or two sentences, reflect on the failure: what the test expected, "
+    "what your code actually did, and what you will change. THEN fix your file(s) so the "
+    "tests pass. Edit ONLY {files}. Do NOT run git. When the logic is correct, stop — "
+    "the orchestrator will re-run the tests."
 )
 
 
@@ -663,9 +733,18 @@ def _build_harness(s, plan):
     return ASTRA_HARNESS_TEMPLATE.format(owned=", ".join(s["files"]), siblings=siblings)
 
 
-def _owner_for_failure(log, subtasks):
-    """Best-effort: the first subtask whose file is named in a red pytest log. Matches
-    whole `*.py` path tokens (not substrings) so `a.py` never matches `aa.py`."""
+def _owner_for_failure(log, subtasks, failures=None):
+    """Best-effort: the first subtask that owns a failing file. PREFERS the gate's
+    STRUCTURED `failures` (file paths parsed from the pytest summary) — a precise signal —
+    and falls back to scanning the raw `log` for whole `*.py` path tokens. Both match on
+    full token / basename (never substring), so `a.py` never maps to `aa.py`."""
+    if failures:
+        names = set(failures)
+        basenames = {f.rsplit("/", 1)[-1] for f in failures}
+        for s in subtasks:
+            for f in s["files"]:
+                if f in names or f.rsplit("/", 1)[-1] in basenames:
+                    return s
     tokens = set(re.findall(r"[\w./-]+\.py", log))
     basenames = {t.rsplit("/", 1)[-1] for t in tokens}
     for s in subtasks:
@@ -675,40 +754,120 @@ def _owner_for_failure(log, subtasks):
     return None
 
 
-def _repair(owner, plan, log, workspace_volume=WORKSPACE_VOLUME):
-    """Spin a fresh shared worker for the owning subtask, hand back its pytest failure
-    so it fixes its own file in the shared tree, then the orchestrator commits."""
-    start_shared_worker(owner["worker"], workspace_volume=workspace_volume)
+def _extract_reflection(state, limit=300):
+    """Best-effort: the worker's last assistant message (its stated reflection), trimmed.
+    Never raises — a missing/odd state just yields ''."""
     try:
-        harness = _build_harness(owner, plan)
-        msg = RED_TEST_HANDBACK_MSG.format(files=", ".join(owner["files"]), log=log[-4000:])
-        astra = make_astra(owner["worker"], system_prompt=ASTRA_SHARED_SYSTEM_PROMPT, harness=harness)
-        run_astra(astra, msg)
+        messages = state.get("messages", []) if isinstance(state, dict) else []
+        for m in reversed(messages):
+            content = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+            if isinstance(content, list):  # some providers return content as parts
+                content = " ".join(
+                    str(p.get("text", p)) if isinstance(p, dict) else str(p) for p in content)
+            if content and str(content).strip():
+                return str(content).strip().replace("\n", " ")[:limit]
+    except Exception:  # noqa: BLE001 — reflection capture must never break a run
+        pass
+    return ""
+
+
+def _repair(owner, plan, log, cap=ASTRA_CAP_SECONDS, workspace_volume=WORKSPACE_VOLUME):
+    """Spin a fresh shared worker for the owning subtask, hand back its pytest failure so
+    it reflects then fixes its own file in the shared tree; the orchestrator commits.
+
+    Runs under the same wall-clock `cap` + container-kill stall-lever as a round worker
+    (via _run_with_cap), so a hung repair can NOT freeze the orchestrator. A repair that
+    times out or errors has its partial changes discarded before the commit. Returns the
+    worker's reflection text (best-effort, '' if unavailable / timed out)."""
+    start_shared_worker(owner["worker"], workspace_volume=workspace_volume)
+    captured = {"reflection": ""}
+    outcomes = {}
+    harness = _build_harness(owner, plan)
+    msg = RED_TEST_HANDBACK_MSG.format(files=", ".join(owner["files"]), log=log[-4000:])
+
+    def work(s, record):
+        astra = make_astra(s["worker"], system_prompt=ASTRA_SHARED_SYSTEM_PROMPT, harness=harness)
+        captured["reflection"] = _extract_reflection(run_astra(astra, msg))
+        return True
+
+    try:
+        _, outcomes, _ = _run_with_cap([owner], cap, work)
     finally:
+        if outcomes.get(owner["branch"]) != "READY":
+            # timed out or errored -> drop the half-done repair so it isn't committed
+            _discard_worker_changes(owner, workspace_volume=workspace_volume)
         commit_workspace(f"astraeus: repair {owner['id']}", workspace_volume=workspace_volume)
         dcmd(["rm", "-f", owner["worker"]], check=False)
+    return captured["reflection"]
 
 
-def _gate_with_repair(subtasks, plan, max_attempts=2, workspace_volume=WORKSPACE_VOLUME):
+def _gate_with_repair(subtasks, plan, candidate="candidate", max_attempts=2,
+                      cap=ASTRA_CAP_SECONDS, workspace_volume=WORKSPACE_VOLUME,
+                      progress=None, on_repair=None):
     """Gate the integrated tree (already pushed as `candidate`); on a RED TEST hand it
     back to the owning worker, bounded by max_attempts. Conflicts cannot occur (one
     integrated tree), so the only failure mode is a red test — which Typhoon can
-    self-repair. Returns (landed, attempts, log).
+    self-repair. Returns (landed, attempts, log, gate_state) where gate_state is one
+    of "landed", "retry_exhausted", "repair_no_owner", "conflict" — the explicit
+    terminal state of the loop, so the transcript records WHY it stopped. `progress`,
+    if given, is called (attempts, log, interim_state) after each gate run; `on_repair`,
+    if given, is called (owner_id, attempt, reflection) after each handback.
     """
-    r = merge_gate("candidate")
+    r = merge_gate(candidate)
     attempts = 1
+    gate_state = None
+    if progress:
+        progress(attempts, r.log, "landed" if r.ok else "gating")
     while (not r.ok) and (not r.conflicts) and attempts < max_attempts:
-        owner = _owner_for_failure(r.log, subtasks)
+        owner = _owner_for_failure(r.log, subtasks, failures=r.failures)
         if owner is None:
             print("[astraeus] gate red but no owning subtask found in the log; stopping retry")
+            gate_state = "repair_no_owner"
             break
         print(f"[astraeus] gate red -> handback to {owner['id']} "
               f"(repair {attempts}/{max_attempts - 1})")
-        _repair(owner, plan, r.log, workspace_volume=workspace_volume)
-        push_candidate(workspace_volume=workspace_volume)
-        r = merge_gate("candidate")
+        emit("gate", owner["id"], "handback")
+        reflection = _repair(owner, plan, r.log, cap=cap, workspace_volume=workspace_volume)
+        if on_repair:
+            on_repair(owner["id"], attempts, reflection)
+        push_candidate(candidate=candidate, workspace_volume=workspace_volume)
+        r = merge_gate(candidate)
         attempts += 1
-    return r.ok, attempts, r.log
+        if progress:
+            progress(attempts, r.log, "landed" if r.ok else "gating")
+    if gate_state is None:
+        gate_state = "landed" if r.ok else ("conflict" if r.conflicts else "retry_exhausted")
+    if progress:
+        progress(attempts, r.log, gate_state)
+    return r.ok, attempts, r.log, gate_state
+
+
+def _build_result(task, plan, rounds, outcomes, timeline, t0, landed=False,
+                  attempts=0, gate_log="", gate_state="running", origin_log="", repairs=None):
+    """Assemble the run.json result dict from current run state. Used for the final
+    transcript AND for live partial re-flushes during a run (defaults describe a run
+    still in progress: gate_state='running')."""
+    return {
+        "task": task,
+        "plan": plan,
+        "rounds": [[s["id"] for s in r] for r in rounds],
+        "outcomes": outcomes,
+        "gate_attempts": attempts,
+        "landed": landed,
+        "gate_state": gate_state,
+        "repairs": repairs or [],
+        "gate_log": gate_log,
+        "origin_log": origin_log,
+        "timeline": [{"t": round(t - t0, 3), "id": b, "event": e}
+                     for (t, b, e) in sorted(timeline)],
+    }
+
+
+def flush_transcript(result, workspace_volume=WORKSPACE_VOLUME):
+    """Write run.json to the shared tree WITHOUT committing — a live progress snapshot
+    a TUI can tail. The final write_transcript() commits the permanent record."""
+    seed_workspace_file(".astraeus/run.json", json.dumps(result, indent=2),
+                        workspace_volume=workspace_volume)
 
 
 def write_transcript(result, workspace_volume=WORKSPACE_VOLUME):
@@ -757,19 +916,37 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
     print("[astraeus] schedule: " + " | ".join(
         "+".join(s["id"] for s in r) for r in rounds))
 
-    timeline_all, outcomes_all, t0 = [], {}, time.monotonic()
+    timeline_all, outcomes_all, repairs_all, t0 = [], {}, [], time.monotonic()
     try:
         for rn, rnd in enumerate(rounds):
             print(f"[astraeus] round {rn + 1}/{len(rounds)}: {[s['id'] for s in rnd]}")
+            emit("round", str(rn + 1),
+                 {"round": rn + 1, "total": len(rounds), "ids": [s["id"] for s in rnd]})
             timeline, outcomes, _ = run_round(rnd, cap, workspace_volume=workspace_volume)
             timeline_all.extend(timeline)
             outcomes_all.update(outcomes)
-            # Only completed work is committed: drop partial files from any worker that
-            # stalled or errored, so incomplete work is rejected (not silently landed).
+            # Only completed, COMPILING work is committed. Drop a worker's files when it
+            # (a) stalled/errored (partial work), or (b) finished READY but left a file that
+            # does NOT compile — a syntax error would crash pytest collection for the WHOLE
+            # suite at the gate, masking every sibling. Both run BEFORE the round commit, so
+            # the working-tree discard (checkout+clean) removes the bad files cleanly and
+            # only importable code is ever committed toward the candidate.
             for s in rnd:
                 if outcomes.get(s["branch"]) != "READY":
                     _discard_worker_changes(s, workspace_volume=workspace_volume)
+                elif not _syntax_check(s["files"], workspace_volume=workspace_volume):
+                    print(f"[astraeus] syntax guardrail: {s['id']} left non-compiling file(s) -> dropping")
+                    outcomes[s["branch"]] = outcomes_all[s["branch"]] = "FAILED_ERROR"
+                    _discard_worker_changes(s, workspace_volume=workspace_volume)
+            # Code-enforce file ownership: drop any out-of-lane stray files before the commit.
+            stray = _enforce_ownership(rnd, workspace_volume=workspace_volume)
+            if stray:
+                print(f"[astraeus] ownership guard dropped out-of-scope path(s): {stray}")
             commit_workspace(f"astraeus: round {rn + 1}", workspace_volume=workspace_volume)
+            # Live snapshot for the TUI tail (written to the tree, committed with the next round).
+            flush_transcript(_build_result(task, plan, rounds, outcomes_all, timeline_all, t0,
+                                           repairs=repairs_all),
+                             workspace_volume=workspace_volume)
             for s in rnd:
                 dcmd(["rm", "-f", s["worker"]], check=False)
     except Exception:
@@ -777,26 +954,41 @@ def run_task(task, plan=None, max_attempts=2, cap=ASTRA_CAP_SECONDS,
             dcmd(["rm", "-f", s["worker"]], check=False)
         raise
 
-    # Gate the integrated tree (pushed as `candidate`) with bounded red-test repair.
-    push_candidate(workspace_volume=workspace_volume)
-    landed, attempts, gate_log = _gate_with_repair(
-        subtasks, plan, max_attempts=max_attempts, workspace_volume=workspace_volume)
+    # Gate the integrated tree (pushed as a per-run unique candidate ref) with bounded
+    # red-test repair. A unique ref means overlapping runs never collide on `candidate`.
+    candidate = f"candidate-{uuid.uuid4().hex[:8]}"
 
-    origin_log = origin_main_log()
-    result = {
-        "task": task,
-        "plan": plan,
-        "rounds": [[s["id"] for s in r] for r in rounds],
-        "outcomes": outcomes_all,
-        "gate_attempts": attempts,
-        "landed": landed,
-        "gate_log": gate_log,
-        "origin_log": origin_log,
-        "timeline": [{"t": round(t - t0, 3), "id": b, "event": e}
-                     for (t, b, e) in sorted(timeline_all)],
-    }
-    write_transcript(result, workspace_volume=workspace_volume)
-    print(f"[astraeus] run_task done: landed={landed} gate_attempts={attempts}")
+    def _progress(attempts, gate_log, gate_state):
+        # Live snapshot during gating so the TUI tail sees repair attempts as they happen.
+        flush_transcript(_build_result(task, plan, rounds, outcomes_all, timeline_all, t0,
+                                       landed=(gate_state == "landed"), attempts=attempts,
+                                       gate_log=gate_log, gate_state=gate_state,
+                                       repairs=repairs_all),
+                         workspace_volume=workspace_volume)
+
+    def _on_repair(owner_id, attempt, reflection):
+        # Reflexion: record the worker's self-reflection for each bounded repair attempt.
+        repairs_all.append({"owner_id": owner_id, "attempt": attempt, "reflection": reflection})
+
+    try:
+        push_candidate(candidate=candidate, workspace_volume=workspace_volume)
+        landed, attempts, gate_log, gate_state = _gate_with_repair(
+            subtasks, plan, candidate=candidate, max_attempts=max_attempts, cap=cap,
+            workspace_volume=workspace_volume, progress=_progress, on_repair=_on_repair)
+        origin_log = origin_main_log()
+        result = _build_result(task, plan, rounds, outcomes_all, timeline_all, t0,
+                               landed=landed, attempts=attempts, gate_log=gate_log,
+                               gate_state=gate_state, origin_log=origin_log, repairs=repairs_all)
+        write_transcript(result, workspace_volume=workspace_volume)
+    except Exception as e:  # noqa: BLE001 — durability: never lose the run record on a gate/docker crash
+        result = _build_result(task, plan, rounds, outcomes_all, timeline_all, t0,
+                               landed=False, gate_state="error",
+                               gate_log=f"{type(e).__name__}: {e}", repairs=repairs_all)
+        flush_transcript(result, workspace_volume=workspace_volume)
+        emit("done", "run", {"landed": False, "gate_state": "error", "attempts": 0})
+        raise
+    emit("done", "run", {"landed": landed, "gate_state": gate_state, "attempts": attempts})
+    print(f"[astraeus] run_task done: landed={landed} gate_state={gate_state} gate_attempts={attempts}")
     print("[astraeus] origin main log:\n" + origin_log)
     return result
 

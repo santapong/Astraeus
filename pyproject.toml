@@ -7,6 +7,7 @@ dependencies = ["deepagents==0.6.8", "langchain-openai"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+tui = ["textual"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

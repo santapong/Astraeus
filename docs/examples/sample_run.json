@@ -1,0 +1,22 @@
+{
+  "task": "Write a function add(a, b) with a pytest test, and mul(a, b) with a pytest test.",
+  "plan": [
+    {"id": "w1", "files": ["a.py", "test_a.py"], "instruction": "Implement add(a, b) returning a + b, with a pytest test asserting add(2, 3) == 5."},
+    {"id": "w2", "files": ["b.py", "test_b.py"], "instruction": "Implement mul(a, b) returning a * b, with a pytest test asserting mul(2, 3) == 6."}
+  ],
+  "rounds": [["w1", "w2"]],
+  "outcomes": {"w1": "READY", "w2": "READY"},
+  "gate_attempts": 1,
+  "landed": true,
+  "gate_state": "landed",
+  "gate_log": "==== 4 passed in 0.12s ====",
+  "origin_log": "d4e5f6a astraeus: run transcript\n9c8b7a6 merge candidate\n1a2b3c4 astraeus: round 1\n0f0f0f0 astraeus: seed task + plan\n7418666 init main",
+  "timeline": [
+    {"t": 0.0, "id": "w1", "event": "thread start"},
+    {"t": 0.01, "id": "w2", "event": "thread start"},
+    {"t": 0.02, "id": "w1", "event": "astra dispatch begin"},
+    {"t": 0.03, "id": "w2", "event": "astra dispatch begin"},
+    {"t": 11.84, "id": "w2", "event": "astra dispatch end"},
+    {"t": 12.31, "id": "w1", "event": "astra dispatch end"}
+  ]
+}

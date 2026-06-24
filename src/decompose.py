@@ -14,6 +14,14 @@ from src.worker import _build_typhoon_model
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "decompose.md"
 
+# Fed back to the model on a bounded retry (the planning analogue of the gate's red-test
+# handback): tell it exactly why the last output was rejected and demand clean JSON.
+_RETRY_SUFFIX = (
+    "\n\nYour previous response was REJECTED: {error}\n"
+    "Return ONLY a valid JSON array of subtask objects matching the schema above — "
+    "no prose, no markdown fences."
+)
+
 
 class DecomposeError(Exception):
     """Raised when the model output is not valid, schema-conforming JSON."""
@@ -98,16 +106,26 @@ def _validate(subtasks):
     return subtasks
 
 
-def decompose(task, model=None):
-    """Split `task` into 2..MAX_WORKERS subtasks (validated). Files may overlap."""
-    model = model or _build_typhoon_model()
-    prompt = _PROMPT_PATH.read_text().replace("{task}", task)
+def decompose(task, model=None, max_attempts=2):
+    """Split `task` into 2..MAX_WORKERS subtasks (validated). Files may overlap.
 
-    raw = model.invoke(prompt).content
-    text = raw if isinstance(raw, str) else str(raw)
-    try:
-        subtasks = _extract_json_array(text)
-        return _validate(subtasks)
-    except DecomposeError:
-        print("[decompose] RAW MODEL OUTPUT >>>\n" + text + "\n<<< END RAW OUTPUT")
-        raise
+    A single structured model call on the happy path; on invalid / non-conforming output it
+    re-prompts up to `max_attempts` times, feeding the validation error back to the model —
+    a bounded retry (the planning analogue of the gate's red-test handback). Raises the last
+    DecomposeError if every attempt fails.
+    """
+    model = model or _build_typhoon_model()
+    base = _PROMPT_PATH.read_text().replace("{task}", task)
+    prompt = base
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        raw = model.invoke(prompt).content
+        text = raw if isinstance(raw, str) else str(raw)
+        try:
+            return _validate(_extract_json_array(text))
+        except DecomposeError as e:
+            last_err = e
+            print(f"[decompose] attempt {attempt}/{max_attempts} invalid: {e}")
+            print("[decompose] RAW MODEL OUTPUT >>>\n" + text + "\n<<< END RAW OUTPUT")
+            prompt = base + _RETRY_SUFFIX.format(error=e)
+    raise last_err
